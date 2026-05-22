@@ -5,7 +5,7 @@ plugins {
 }
 
 group = "io.github.andriyo"
-version = "1.0.0"
+version = "1.1.0"
 
 val androidStudioVersion = providers.gradleProperty("androidStudioVersion").orElse("2024.2.1.11")
 val androidStudioPath = providers.gradleProperty("androidStudioPath")
@@ -41,6 +41,12 @@ intellijPlatform {
         }
 
         changeNotes = """
+            <h3>1.1.0</h3>
+            <ul>
+              <li>New: reset the device clock on every connect by forcing an NTP resync (toggles <code>auto_time</code> and <code>auto_time_zone</code>). Useful when emulators or devices have drifted.</li>
+              <li>New setting "Reset device clock on connect" (Tools &rarr; Proxy Commander &rarr; Settings...), enabled by default.</li>
+              <li>Replaced the deprecated <code>TextFieldWithBrowseButton.addBrowseFolderListener</code> 4-arg overload with the current API.</li>
+            </ul>
             <h3>1.0.0</h3>
             <ul>
               <li>Initial release.</li>
