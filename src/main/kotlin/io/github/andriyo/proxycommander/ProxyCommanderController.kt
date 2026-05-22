@@ -1,4 +1,4 @@
-package com.andrii.proxycommander
+package io.github.andriyo.proxycommander
 
 import com.intellij.openapi.project.Project
 import java.io.File

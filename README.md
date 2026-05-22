@@ -60,7 +60,7 @@ These tests call `ProxyCommanderController` methods directly and verify on conne
 Run:
 
 ```bash
-PROXY_COMMANDER_RUN_INTEGRATION_TESTS=1 ./gradlew test --tests com.andrii.proxycommander.ProxyCommanderIntegrationTest
+PROXY_COMMANDER_RUN_INTEGRATION_TESTS=1 ./gradlew test --tests io.github.andriyo.proxycommander.ProxyCommanderIntegrationTest
 ```
 
 Optional:

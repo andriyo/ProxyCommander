@@ -1,4 +1,4 @@
-package com.andrii.proxycommander
+package io.github.andriyo.proxycommander
 
 import com.intellij.icons.AllIcons
 import com.intellij.notification.Notification

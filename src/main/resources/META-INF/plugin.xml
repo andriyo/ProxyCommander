@@ -1,20 +1,38 @@
 <!-- Plugin Configuration File: https://plugins.jetbrains.com/docs/intellij/plugin-configuration-file.html -->
 <idea-plugin>
     <!-- Unique identifier of the plugin. It should be FQN, cannot be changed between the plugin versions. -->
-    <id>com.andrii.ProxyCommander</id>
+    <id>io.github.andriyo.proxycommander</id>
 
     <!-- Public plugin name should be written in Title Case.
          Guidelines: https://plugins.jetbrains.com/docs/marketplace/best-practices-for-listing.html#plugin-name -->
     <name>ProxyCommander</name>
 
     <!-- A displayed Vendor name or Organization ID displayed on the Plugins Page. -->
-    <vendor url="https://www.yourcompany.com">YourCompany</vendor>
+    <vendor email="andriyo@gmail.com" url="https://github.com/andriyo/ProxyCommander">Andrii Olefirenko</vendor>
 
     <!-- Description of the plugin displayed on the Plugin Page and IDE Plugin Manager.
          Guidelines: https://plugins.jetbrains.com/docs/marketplace/best-practices-for-listing.html#plugin-description -->
     <description><![CDATA[
-        Enter short description for your plugin here.<br>
-        <em>most HTML tags may be used</em>
+        <p>Android Studio plugin for fast control of <code>adb reverse</code> and device HTTP proxy setup across emulators and physical devices used during development.</p>
+
+        <p>Useful when you run a local backend, mock server, or HTTP debugger (Charles, mitmproxy, Proxyman) on your workstation and want every connected device to route traffic through it without configuring each one by hand.</p>
+
+        <h3>Actions</h3>
+        <ul>
+          <li><b>Connect All</b> &mdash; enable <code>adb reverse tcp:&lt;port&gt; tcp:&lt;port&gt;</code> and set <code>global http_proxy</code> on every connected device.</li>
+          <li><b>Connect One and Disconnect Others</b> &mdash; detect the active emulator from the IDE context, connect proxy on it, clear proxy on everything else.</li>
+          <li><b>Disconnect All</b> &mdash; remove reverse mapping and clear all proxy settings (including PAC).</li>
+          <li><b>Select Device and Disconnect Others</b> &mdash; pick from a list of connected emulators and keep only that one connected.</li>
+        </ul>
+
+        <h3>Where actions appear</h3>
+        <ul>
+          <li><code>Tools &rarr; Proxy Commander</code></li>
+          <li>Run toolbar, next to the Android attach debugger actions</li>
+          <li>Running Devices secondary toolbar</li>
+        </ul>
+
+        <p>Port (default <code>8888</code>) and ADB executable path are configurable under <code>Tools &rarr; Proxy Commander &rarr; Settings...</code>. If no ADB path is set, the plugin falls back to <code>$ADB</code> or <code>adb</code> on <code>PATH</code>.</p>
     ]]></description>
 
     <!-- Product and plugin compatibility requirements.
@@ -27,33 +45,33 @@
         <group id="ProxyCommander.ActionsGroup" text="Proxy Commander" description="Proxy Commander device actions" popup="true">
             <add-to-group group-id="ToolsMenu" anchor="last"/>
             <action id="ProxyCommander.ConnectAllDevicesAction"
-                    class="com.andrii.proxycommander.ConnectAllDevicesAction"
+                    class="io.github.andriyo.proxycommander.ConnectAllDevicesAction"
                     text="Connect All"
                     description="Enable reverse proxy and HTTP proxy on all connected devices"
                     icon="/icons/proxy_connect_all.svg"/>
             <action id="ProxyCommander.ConnectActiveEmulatorClearOthersProxyAction"
-                    class="com.andrii.proxycommander.ConnectActiveEmulatorClearOthersProxyAction"
+                    class="io.github.andriyo.proxycommander.ConnectActiveEmulatorClearOthersProxyAction"
                     text="Connect One and Disconnect Others"
                     description="Enable reverse+proxy for active emulator and clear proxy on all other connected devices"
                     icon="/icons/proxy_connect_active.svg"/>
             <action id="ProxyCommander.DisconnectAllDevicesAction"
-                    class="com.andrii.proxycommander.DisconnectAllDevicesAction"
+                    class="io.github.andriyo.proxycommander.DisconnectAllDevicesAction"
                     text="Disconnect All"
                     description="Disable reverse proxy and clear HTTP proxy on all connected devices"
                     icon="/icons/proxy_disconnect_all.svg"/>
             <action id="ProxyCommander.KeepSelectedDeviceAction"
-                    class="com.andrii.proxycommander.KeepSelectedDeviceAction"
+                    class="io.github.andriyo.proxycommander.KeepSelectedDeviceAction"
                     text="Select Device and Disconnect Others"
                     description="Choose one connected device and disconnect all other devices"
                     icon="/icons/proxy_keep_selected.svg"/>
             <separator/>
             <action id="ProxyCommander.SettingsAction"
-                    class="com.andrii.proxycommander.ProxyCommanderSettingsAction"
+                    class="io.github.andriyo.proxycommander.ProxyCommanderSettingsAction"
                     text="Settings..."
                     description="Configure Proxy Commander port and adb path"
                     icon="/icons/proxy_settings.svg"/>
             <action id="ProxyCommander.StreamingContextTestAction"
-                    class="com.andrii.proxycommander.StreamingToolbarContextTestAction"
+                    class="io.github.andriyo.proxycommander.StreamingToolbarContextTestAction"
                     text="Show Current Device Context (Test)"
                     description="Show serial and kind for the device from Running Devices context"
                     icon="/icons/proxy_context.svg"/>

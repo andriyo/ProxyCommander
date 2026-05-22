@@ -1,13 +1,13 @@
-package com.andrii.proxycommander
+package io.github.andriyo.proxycommander
 
 import com.sun.net.httpserver.HttpServer
-import org.junit.After
-import org.junit.Assert.assertEquals
-import org.junit.Assert.assertFalse
-import org.junit.Assert.assertTrue
-import org.junit.Assume.assumeTrue
-import org.junit.Before
-import org.junit.Test
+import org.junit.jupiter.api.AfterEach
+import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertTrue
+import org.junit.jupiter.api.Assumptions.assumeTrue
+import org.junit.jupiter.api.BeforeEach
+import org.junit.jupiter.api.Test
 import java.io.File
 import java.net.ConnectException
 import java.net.InetSocketAddress
@@ -27,17 +27,17 @@ class ProxyCommanderIntegrationTest {
 
     private val logs = mutableListOf<String>()
 
-    @Before
+    @BeforeEach
     fun ensureIntegrationPreconditions() {
-        assumeTrue("Set $ENABLE_ENV=1 to run adb integration tests.", testEnabled)
-        assumeTrue("adb is unavailable.", runLocalCommand("adb", "version").exitCode == 0)
+        assumeTrue(testEnabled, "Set $ENABLE_ENV=1 to run adb integration tests.")
+        assumeTrue(runLocalCommand("adb", "version").exitCode == 0, "adb is unavailable.")
         val devices = controller.listConnectedDevices(logs::add)
-        assumeTrue("At least one connected device is required.", devices.isNotEmpty())
+        assumeTrue(devices.isNotEmpty(), "At least one connected device is required.")
         val ncCapable = devices.any { hasNc(it.serial) }
-        assumeTrue("No connected device has 'nc' available in shell.", ncCapable)
+        assumeTrue(ncCapable, "No connected device has 'nc' available in shell.")
     }
 
-    @After
+    @AfterEach
     fun cleanupAfterTest() {
         if (!testEnabled) {
             return
@@ -48,45 +48,45 @@ class ProxyCommanderIntegrationTest {
     @Test
     fun connectAllAndDisconnectAll_toggleReverseAndProxyAndConnectivity() {
         val devices = controller.listConnectedDevices(logs::add)
-        assumeTrue("At least one connected device is required.", devices.isNotEmpty())
+        assumeTrue(devices.isNotEmpty(), "At least one connected device is required.")
 
         val localServer = ensureLocalEndpointListening(proxyPort)
-        assumeTrue("No endpoint available on host at 127.0.0.1:$proxyPort.", isHostPortOpen("127.0.0.1", proxyPort))
+        assumeTrue(isHostPortOpen("127.0.0.1", proxyPort), "No endpoint available on host at 127.0.0.1:$proxyPort.")
 
         try {
-            assertTrue("connectAllDevices failed.\n${logs.joinToString("\n")}", controller.connectAllDevices(logs::add))
+            assertTrue(controller.connectAllDevices(logs::add), "connectAllDevices failed.\n${logs.joinToString("\n")}")
 
             devices.forEach { device ->
-                assertTrue("Reverse mapping missing on ${device.serial}", hasReverseMapping(device.serial, proxyPort))
+                assertTrue(hasReverseMapping(device.serial, proxyPort), "Reverse mapping missing on ${device.serial}")
                 assertEquals(
-                    "Unexpected http_proxy on ${device.serial}",
                     "localhost:$proxyPort",
-                    readGlobalSetting(device.serial, "http_proxy")
+                    readGlobalSetting(device.serial, "http_proxy"),
+                    "Unexpected http_proxy on ${device.serial}"
                 )
                 assertTrue(
-                    "Device ${device.serial} cannot reach http://0.0.0.0:$proxyPort while connected.",
-                    canDeviceAccessHttp(device.serial, "0.0.0.0", proxyPort)
+                    canDeviceAccessHttp(device.serial, "0.0.0.0", proxyPort),
+                    "Device ${device.serial} cannot reach http://0.0.0.0:$proxyPort while connected."
                 )
             }
 
-            assertTrue("disconnectAllDevices failed.\n${logs.joinToString("\n")}", controller.disconnectAllDevices(logs::add))
+            assertTrue(controller.disconnectAllDevices(logs::add), "disconnectAllDevices failed.\n${logs.joinToString("\n")}")
 
             devices.forEach { device ->
                 assertFalse(
-                    "Reverse mapping still present on ${device.serial}",
-                    hasReverseMapping(device.serial, proxyPort)
+                    hasReverseMapping(device.serial, proxyPort),
+                    "Reverse mapping still present on ${device.serial}"
                 )
                 assertTrue(
-                    "Proxy settings are not fully cleared on ${device.serial}",
-                    isProxyCleared(device.serial)
+                    isProxyCleared(device.serial),
+                    "Proxy settings are not fully cleared on ${device.serial}"
                 )
                 assertFalse(
-                    "Device ${device.serial} can still reach http://0.0.0.0:$proxyPort after disconnect.",
-                    canDeviceAccessHttp(device.serial, "0.0.0.0", proxyPort)
+                    canDeviceAccessHttp(device.serial, "0.0.0.0", proxyPort),
+                    "Device ${device.serial} can still reach http://0.0.0.0:$proxyPort after disconnect."
                 )
                 assertTrue(
-                    "General connectivity appears broken on ${device.serial} after disconnect.",
-                    canReachAnyInternetHost(device.serial)
+                    canReachAnyInternetHost(device.serial),
+                    "General connectivity appears broken on ${device.serial} after disconnect."
                 )
             }
         } finally {
@@ -99,37 +99,37 @@ class ProxyCommanderIntegrationTest {
     fun connectOneAndDisconnectOthers_keepsOnlySelectedDeviceConnected() {
         val devices = controller.listConnectedDevices(logs::add)
         val emulators = devices.filter { it.isEmulator }
-        assumeTrue("At least one connected emulator is required.", emulators.isNotEmpty())
-        assumeTrue("At least two connected devices are required.", devices.size >= 2)
+        assumeTrue(emulators.isNotEmpty(), "At least one connected emulator is required.")
+        assumeTrue(devices.size >= 2, "At least two connected devices are required.")
 
         val selectedSerial = emulators.first().serial
         val localServer = ensureLocalEndpointListening(proxyPort)
-        assumeTrue("No endpoint available on host at 127.0.0.1:$proxyPort.", isHostPortOpen("127.0.0.1", proxyPort))
+        assumeTrue(isHostPortOpen("127.0.0.1", proxyPort), "No endpoint available on host at 127.0.0.1:$proxyPort.")
 
         try {
             controller.disconnectAllDevices(logs::add)
             assertTrue(
-                "connectEmulatorAndClearProxyOnOthers failed.\n${logs.joinToString("\n")}",
-                controller.connectEmulatorAndClearProxyOnOthers(selectedSerial, logs::add)
+                controller.connectEmulatorAndClearProxyOnOthers(selectedSerial, logs::add),
+                "connectEmulatorAndClearProxyOnOthers failed.\n${logs.joinToString("\n")}"
             )
 
-            assertTrue("Selected device reverse mapping missing.", hasReverseMapping(selectedSerial, proxyPort))
+            assertTrue(hasReverseMapping(selectedSerial, proxyPort), "Selected device reverse mapping missing.")
             assertEquals(
-                "Selected device proxy is not configured.",
                 "localhost:$proxyPort",
-                readGlobalSetting(selectedSerial, "http_proxy")
+                readGlobalSetting(selectedSerial, "http_proxy"),
+                "Selected device proxy is not configured."
             )
             assertTrue(
-                "Selected device cannot reach http://0.0.0.0:$proxyPort.",
-                canDeviceAccessHttp(selectedSerial, "0.0.0.0", proxyPort)
+                canDeviceAccessHttp(selectedSerial, "0.0.0.0", proxyPort),
+                "Selected device cannot reach http://0.0.0.0:$proxyPort."
             )
 
             devices.filterNot { it.serial == selectedSerial }.forEach { other ->
-                assertFalse("Unexpected reverse mapping on ${other.serial}", hasReverseMapping(other.serial, proxyPort))
-                assertTrue("Proxy is not cleared on ${other.serial}", isProxyCleared(other.serial))
+                assertFalse(hasReverseMapping(other.serial, proxyPort), "Unexpected reverse mapping on ${other.serial}")
+                assertTrue(isProxyCleared(other.serial), "Proxy is not cleared on ${other.serial}")
                 assertFalse(
-                    "Device ${other.serial} can still reach http://0.0.0.0:$proxyPort.",
-                    canDeviceAccessHttp(other.serial, "0.0.0.0", proxyPort)
+                    canDeviceAccessHttp(other.serial, "0.0.0.0", proxyPort),
+                    "Device ${other.serial} can still reach http://0.0.0.0:$proxyPort."
                 )
             }
         } finally {

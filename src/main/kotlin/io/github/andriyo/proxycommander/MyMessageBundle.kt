@@ -1,4 +1,4 @@
-package com.andrii.proxycommander
+package io.github.andriyo.proxycommander
 
 import com.intellij.DynamicBundle
 import org.jetbrains.annotations.Nls
