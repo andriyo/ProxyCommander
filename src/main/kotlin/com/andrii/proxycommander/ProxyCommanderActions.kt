@@ -33,7 +33,7 @@ import javax.swing.JComponent
 import javax.swing.JPanel
 
 class ConnectAllDevicesAction : DumbAwareAction(
-    "Connect All Devices",
+    "Connect All",
     "Enable reverse proxy and HTTP proxy on all connected devices",
     null
 ) {
@@ -44,7 +44,7 @@ class ConnectAllDevicesAction : DumbAwareAction(
 }
 
 class DisconnectAllDevicesAction : DumbAwareAction(
-    "Disconnect All Devices",
+    "Disconnect All",
     "Disable reverse proxy and clear HTTP proxy on all connected devices",
     null
 ) {
@@ -66,7 +66,7 @@ class KeepSelectedDeviceAction : DumbAwareAction(
 }
 
 class ConnectActiveEmulatorClearOthersProxyAction : DumbAwareAction(
-    "Connect Active Emulator and Clear Others Proxy",
+    "Connect One and Disconnect Others",
     "Enable reverse+proxy for active emulator and clear proxy on all other connected devices",
     AllIcons.Actions.Execute
 ) {
@@ -79,23 +79,6 @@ class ConnectActiveEmulatorClearOthersProxyAction : DumbAwareAction(
         val project = event.project ?: return
         val target = ProxyCommanderStreamingContextResolver.extract(event)
         ProxyCommanderActionRunner.runConnectActiveEmulatorAndClearOthersProxy(project, target)
-    }
-}
-
-class FillPasswordOnActiveDeviceAction : DumbAwareAction(
-    "Fill Password on Active Device",
-    "Detect password field in active app and input configured dev password",
-    AllIcons.Actions.Edit
-) {
-    override fun update(event: AnActionEvent) {
-        event.presentation.isVisible = true
-        event.presentation.isEnabled = event.project != null
-    }
-
-    override fun actionPerformed(event: AnActionEvent) {
-        val project = event.project ?: return
-        val target = ProxyCommanderStreamingContextResolver.extract(event)
-        ProxyCommanderActionRunner.runFillPasswordOnActiveDevice(project, target)
     }
 }
 
@@ -209,7 +192,7 @@ private object ProxyCommanderActionRunner {
             runInBackground(
                 project = project,
                 actionName = "Disconnect all devices except $selectedSerial"
-            ) { controller, _, log ->
+            ) { controller, log ->
                 controller.keepOnlyDevice(selectedSerial, log)
             }
         }
@@ -219,27 +202,10 @@ private object ProxyCommanderActionRunner {
         runInBackground(
             project = project,
             actionName = "Connect active emulator and clear proxy on other devices"
-        ) { controller, _, log ->
+        ) { controller, log ->
             val activeSerial = resolveActiveEmulatorSerial(target, controller, log)
                 ?: return@runInBackground false
             controller.connectEmulatorAndClearProxyOnOthers(activeSerial, log)
-        }
-    }
-
-    fun runFillPasswordOnActiveDevice(project: Project, target: StreamingTarget?) {
-        runInBackground(
-            project = project,
-            actionName = "Fill password on active device"
-        ) { controller, config, log ->
-            val password = config.devPassword
-            if (password.isEmpty()) {
-                log("[ProxyCommander] Development password is empty. Set it in Proxy Commander Settings.")
-                return@runInBackground false
-            }
-
-            val activeSerial = resolveActiveDeviceSerial(target, controller, log)
-                ?: return@runInBackground false
-            controller.enterPasswordInActiveApp(activeSerial, password, log)
         }
     }
 
@@ -254,8 +220,7 @@ private object ProxyCommanderActionRunner {
 
             settings.updateConfig(
                 port = dialog.selectedPort(),
-                adbPath = dialog.selectedAdbPath(),
-                devPassword = dialog.selectedDevPassword()
+                adbPath = dialog.selectedAdbPath()
             )
             val adbSummary = dialog.selectedAdbPath().ifBlank { "<PATH or \$ADB>" }
             notify(
@@ -269,14 +234,14 @@ private object ProxyCommanderActionRunner {
     private fun runInBackground(
         project: Project,
         actionName: String,
-        operation: (ProxyCommanderController, ProxyCommanderConfig, (String) -> Unit) -> Boolean
+        operation: (ProxyCommanderController, (String) -> Unit) -> Boolean
     ) {
         val config = ProxyCommanderSettingsService.getInstance(project).getConfig()
         ApplicationManager.getApplication().executeOnPooledThread {
             val logs = mutableListOf<String>()
             val controller = ProxyCommanderController(project, config)
             val success = runCatching {
-                operation(controller, config, logs::add)
+                operation(controller, logs::add)
             }.getOrElse { error ->
                 logs += "[ProxyCommander] Error: ${error.message}"
                 false
@@ -292,42 +257,6 @@ private object ProxyCommanderActionRunner {
                 message = summarize(logs, fallback),
                 type = if (success) NotificationType.INFORMATION else NotificationType.ERROR
             )
-        }
-    }
-
-    private fun resolveActiveDeviceSerial(
-        target: StreamingTarget?,
-        controller: ProxyCommanderController,
-        log: (String) -> Unit
-    ): String? {
-        val targetSerial = target?.serial?.trim().orEmpty()
-        if (targetSerial.isNotEmpty()) {
-            val exists = controller.listConnectedDevices(log).any { it.serial == targetSerial }
-            if (!exists) {
-                log("[ProxyCommander] Active target '$targetSerial' is not connected.")
-                return null
-            }
-            val source = target?.source ?: "unknown source"
-            log("[ProxyCommander] Active device from $source: $targetSerial")
-            return targetSerial
-        }
-
-        val connectedDevices = controller.listConnectedDevices(log)
-        return when (connectedDevices.size) {
-            0 -> {
-                log("[ProxyCommander] No connected devices found.")
-                null
-            }
-            1 -> {
-                val only = connectedDevices.first()
-                log("[ProxyCommander] Active device context unavailable; using the only connected device ${only.serial}.")
-                only.serial
-            }
-            else -> {
-                val list = connectedDevices.joinToString(", ") { it.serial }
-                log("[ProxyCommander] Unable to determine active device from context. Connected devices: $list.")
-                null
-            }
         }
     }
 
@@ -438,12 +367,10 @@ private class ProxyCommanderSettingsDialog(
 
     private val portField = JBTextField(currentConfig.port.toString())
     private val adbPathField = TextFieldWithBrowseButton()
-    private val devPasswordField = JBTextField(currentConfig.devPassword)
     private val resetDefaultsAction = object : AbstractAction("Reset to Defaults") {
         override fun actionPerformed(event: ActionEvent) {
             portField.text = ProxyCommanderSettingsService.DEFAULT_PORT.toString()
             adbPathField.text = ""
-            devPasswordField.text = ""
         }
     }
 
@@ -463,7 +390,6 @@ private class ProxyCommanderSettingsDialog(
         val panel = FormBuilder.createFormBuilder()
             .addLabeledComponent(JBLabel("Port:"), portField)
             .addLabeledComponent(JBLabel("ADB Path (optional):"), adbPathField)
-            .addLabeledComponent(JBLabel("Dev Password (plain text):"), devPasswordField)
             .addComponent(JBLabel("Leave ADB Path empty to use \$ADB or adb from PATH."))
             .panel
         panel.preferredSize = Dimension(620, panel.preferredSize.height)
@@ -496,8 +422,6 @@ private class ProxyCommanderSettingsDialog(
     fun selectedPort(): Int = portField.text.trim().toInt()
 
     fun selectedAdbPath(): String = adbPathField.text.trim()
-
-    fun selectedDevPassword(): String = devPasswordField.text
 }
 
 private class KeepEmulatorDialog(

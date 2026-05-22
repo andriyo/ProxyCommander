@@ -19,6 +19,8 @@ repositories {
 
 // Read more: https://plugins.jetbrains.com/docs/intellij/tools-intellij-platform-gradle-plugin.html
 dependencies {
+    testImplementation("junit:junit:4.13.2")
+
     intellijPlatform {
         if (androidStudioPath.isPresent && androidStudioPath.get().isNotBlank()) {
             local(androidStudioPath)

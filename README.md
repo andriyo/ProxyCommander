@@ -17,10 +17,6 @@ Android Studio plugin for quickly controlling `adb reverse` and device proxy set
 - Select emulator and disconnect others:
   - shows connected emulator list
   - keeps one connected and disconnects all others
-- Fill password on active device:
-  - detects active device
-  - finds likely password field in foreground app UI hierarchy
-  - enters configured development password
 
 ## Settings
 
@@ -28,9 +24,6 @@ Android Studio plugin for quickly controlling `adb reverse` and device proxy set
 
 - `Port` (default: `8888`)
 - `ADB Path` (optional, falls back to `$ADB` or `adb` in `PATH`)
-- `Dev Password (plain text)` for quick autofill action
-
-Note: dev password is intentionally stored as plain text in project settings for local development convenience.
 
 ## Installation
 
@@ -53,6 +46,26 @@ cd /Users/andrii/IdeaProjects/ProxyCommander
 ```bash
 ./gradlew runIde -PandroidStudioPath="/Users/andrii/Applications/Android Studio.app/Contents"
 ```
+
+## Integration Tests (real adb + devices)
+
+These tests call `ProxyCommanderController` methods directly and verify on connected devices that:
+
+- `Connect All` enables reverse + proxy
+- `Connect One and Disconnect Others` keeps only selected emulator connected
+- `Disconnect All` clears proxy/reverse
+- with connect enabled, devices can reach `http://0.0.0.0:<port>`
+- after disconnect, devices cannot reach `http://0.0.0.0:<port>` but can still reach internet hosts
+
+Run:
+
+```bash
+PROXY_COMMANDER_RUN_INTEGRATION_TESTS=1 ./gradlew test --tests com.andrii.proxycommander.ProxyCommanderIntegrationTest
+```
+
+Optional:
+
+- `PROXY_COMMANDER_IT_PORT` (default: `8080`)
 
 ## Where actions appear
 

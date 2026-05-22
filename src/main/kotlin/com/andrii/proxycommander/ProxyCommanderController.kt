@@ -2,16 +2,11 @@ package com.andrii.proxycommander
 
 import com.intellij.openapi.project.Project
 import java.io.File
-import java.io.StringReader
 import java.util.concurrent.TimeUnit
-import javax.xml.parsers.DocumentBuilderFactory
-import org.w3c.dom.Element
-import org.xml.sax.InputSource
 
 internal data class ProxyCommanderConfig(
     val port: Int = ProxyCommanderSettingsService.DEFAULT_PORT,
-    val adbPath: String = "",
-    val devPassword: String = ""
+    val adbPath: String = ""
 )
 
 internal data class ConnectedDevice(
@@ -25,11 +20,20 @@ internal data class ConnectedEmulator(
     val model: String
 )
 
-internal class ProxyCommanderController(
-    private val project: Project,
+internal class ProxyCommanderController private constructor(
+    private val adbClient: AdbClient,
     private val config: ProxyCommanderConfig
 ) {
-    private val adbClient = AdbClient(project, config.adbPath)
+    constructor(project: Project, config: ProxyCommanderConfig) : this(
+        adbClient = AdbClient(project.basePath?.let(::File), config.adbPath),
+        config = config
+    )
+
+    internal constructor(projectBasePath: String?, config: ProxyCommanderConfig) : this(
+        adbClient = AdbClient(projectBasePath?.let(::File), config.adbPath),
+        config = config
+    )
+
     private val reverseToken = "tcp:${config.port}"
     private val desiredProxy = "localhost:${config.port}"
 
@@ -200,67 +204,6 @@ internal class ProxyCommanderController(
         return !failed
     }
 
-    fun enterPasswordInActiveApp(serial: String, password: String, log: (String) -> Unit): Boolean {
-        val normalizedPassword = password
-        if (normalizedPassword.isEmpty()) {
-            log("[ProxyCommander] Development password is empty. Set it in Proxy Commander Settings.")
-            return false
-        }
-
-        val isConnected = listConnectedDevices(log).any { it.serial == serial }
-        if (!isConnected) {
-            log("[ProxyCommander] Device '$serial' is not connected.")
-            return false
-        }
-
-        val foreground = readForegroundApp(serial)
-        val foregroundSummary = foreground?.let { "${it.packageName}/${it.activity}" }.orEmpty()
-        if (foreground != null) {
-            log("[ProxyCommander] Foreground activity on $serial: $foregroundSummary")
-        } else {
-            log("[ProxyCommander] Unable to resolve foreground activity on $serial; attempting best-effort field detection.")
-        }
-
-        val hierarchyXml = dumpUiHierarchy(serial, log) ?: return false
-        val field = findPasswordField(hierarchyXml, foreground?.packageName)
-        if (field == null) {
-            val suffix = foreground?.let { " for ${it.packageName}/${it.activity}" }.orEmpty()
-            log("[ProxyCommander] No password field found on device '$serial'$suffix.")
-            return false
-        }
-
-        val tapResult = adbClient.run(
-            serial,
-            listOf("shell", "input", "tap", field.centerX.toString(), field.centerY.toString()),
-            allowFailure = true,
-            timeoutMs = 3_000
-        )
-        if (!tapResult.success) {
-            log("[ProxyCommander] Failed to focus password field on $serial: ${tapResult.briefOutput()}")
-            return false
-        }
-
-        val encodedPassword = encodeForAdbInputText(normalizedPassword)
-        if (encodedPassword.isEmpty()) {
-            log("[ProxyCommander] Password could not be encoded for adb input.")
-            return false
-        }
-
-        val inputResult = adbClient.run(
-            serial,
-            listOf("shell", "input", "text", encodedPassword),
-            allowFailure = true,
-            timeoutMs = 3_000
-        )
-        if (!inputResult.success) {
-            log("[ProxyCommander] Failed to input password on $serial: ${inputResult.briefOutput()}")
-            return false
-        }
-
-        log("[ProxyCommander] Password entered on $serial (${field.summary}).")
-        return true
-    }
-
     private fun connectSerial(serial: String, log: (String) -> Unit): Boolean {
         val reverseEnabled = enableReverse(serial, log)
         val proxyConfigured = setDeviceProxy(serial, log)
@@ -421,186 +364,6 @@ internal class ProxyCommanderController(
         }
     }
 
-    private fun readForegroundApp(serial: String): ForegroundApp? {
-        val activityDump = adbClient.run(
-            serial,
-            listOf("shell", "dumpsys", "activity", "activities"),
-            allowFailure = true,
-            timeoutMs = 4_000
-        )
-        if (activityDump.success) {
-            parseForegroundAppFromDump(activityDump.output)?.let { return it }
-        }
-
-        val windowDump = adbClient.run(
-            serial,
-            listOf("shell", "dumpsys", "window", "windows"),
-            allowFailure = true,
-            timeoutMs = 4_000
-        )
-        if (!windowDump.success) {
-            return null
-        }
-        return parseForegroundAppFromDump(windowDump.output)
-    }
-
-    private fun parseForegroundAppFromDump(output: String): ForegroundApp? {
-        val candidates = listOf(
-            FOREGROUND_RESUMED_REGEX,
-            FOREGROUND_TOP_RESUMED_REGEX,
-            FOREGROUND_FOCUS_REGEX
-        )
-        for (line in output.lineSequence()) {
-            for (regex in candidates) {
-                val match = regex.find(line) ?: continue
-                val packageName = match.groupValues[1]
-                val activity = match.groupValues[2]
-                if (packageName.isNotBlank() && activity.isNotBlank()) {
-                    return ForegroundApp(packageName, activity)
-                }
-            }
-        }
-        return null
-    }
-
-    private fun dumpUiHierarchy(serial: String, log: (String) -> Unit): String? {
-        val dumpPath = "/sdcard/proxy_commander_ui_dump.xml"
-        val dumpResult = adbClient.run(
-            serial,
-            listOf("shell", "uiautomator", "dump", dumpPath),
-            allowFailure = true,
-            timeoutMs = 5_000
-        )
-        if (!dumpResult.success) {
-            log("[ProxyCommander] Failed to dump UI hierarchy on $serial: ${dumpResult.briefOutput()}")
-            return null
-        }
-
-        val readResult = adbClient.run(
-            serial,
-            listOf("shell", "cat", dumpPath),
-            allowFailure = true,
-            timeoutMs = 5_000
-        )
-        if (!readResult.success) {
-            log("[ProxyCommander] Failed to read UI hierarchy dump on $serial: ${readResult.briefOutput()}")
-            return null
-        }
-
-        val xml = readResult.output.trim()
-        if (!xml.contains("<hierarchy")) {
-            log("[ProxyCommander] UI hierarchy dump on $serial does not look valid.")
-            return null
-        }
-        return xml
-    }
-
-    private fun findPasswordField(xml: String, foregroundPackage: String?): PasswordFieldTarget? {
-        val document = runCatching {
-            val factory = DocumentBuilderFactory.newInstance()
-            factory.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true)
-            factory.newDocumentBuilder().parse(InputSource(StringReader(xml)))
-        }.getOrNull() ?: return null
-
-        var bestCandidate: PasswordFieldTarget? = null
-        val nodes = document.getElementsByTagName("node")
-        for (index in 0 until nodes.length) {
-            val element = nodes.item(index) as? Element ?: continue
-            val candidate = toPasswordFieldCandidate(element) ?: continue
-            val score = passwordFieldScore(candidate, foregroundPackage)
-            if (score <= 0) {
-                continue
-            }
-            if (bestCandidate == null || score > bestCandidate.score) {
-                bestCandidate = candidate.copy(score = score)
-            }
-        }
-        return bestCandidate
-    }
-
-    private fun toPasswordFieldCandidate(element: Element): PasswordFieldTarget? {
-        val bounds = parseBounds(element.getAttribute("bounds")) ?: return null
-        val enabled = element.getAttribute("enabled").ifBlank { "true" }.toBoolean()
-        if (!enabled) {
-            return null
-        }
-        val clickable = element.getAttribute("clickable").toBoolean()
-        val focusable = element.getAttribute("focusable").toBoolean()
-        val focused = element.getAttribute("focused").toBoolean()
-        val password = element.getAttribute("password").toBoolean()
-        val className = element.getAttribute("class")
-        val packageName = element.getAttribute("package")
-        val resourceId = element.getAttribute("resource-id")
-        val text = element.getAttribute("text")
-        val hint = element.getAttribute("hint")
-        val contentDesc = element.getAttribute("content-desc")
-        return PasswordFieldTarget(
-            centerX = (bounds.first + bounds.third) / 2,
-            centerY = (bounds.second + bounds.fourth) / 2,
-            packageName = packageName,
-            className = className,
-            resourceId = resourceId,
-            text = text,
-            hint = hint,
-            contentDesc = contentDesc,
-            isPassword = password,
-            isClickable = clickable,
-            isFocusable = focusable,
-            isFocused = focused
-        )
-    }
-
-    private fun passwordFieldScore(candidate: PasswordFieldTarget, foregroundPackage: String?): Int {
-        var score = 0
-        if (foregroundPackage != null && candidate.packageName == foregroundPackage) {
-            score += 40
-        }
-        if (candidate.isPassword) {
-            score += 100
-        }
-        if (candidate.className.contains("EditText", ignoreCase = true)) {
-            score += 20
-        }
-        val combinedInfo = listOf(
-            candidate.resourceId,
-            candidate.text,
-            candidate.hint,
-            candidate.contentDesc
-        ).joinToString(" ").lowercase()
-        if (PASSWORD_KEYWORD_REGEX.containsMatchIn(combinedInfo)) {
-            score += 30
-        }
-        if (candidate.isFocused) {
-            score += 10
-        }
-        if (candidate.isClickable || candidate.isFocusable) {
-            score += 5
-        }
-        return score
-    }
-
-    private fun parseBounds(bounds: String): Bounds? {
-        val match = BOUNDS_REGEX.find(bounds) ?: return null
-        val x1 = match.groupValues[1].toIntOrNull() ?: return null
-        val y1 = match.groupValues[2].toIntOrNull() ?: return null
-        val x2 = match.groupValues[3].toIntOrNull() ?: return null
-        val y2 = match.groupValues[4].toIntOrNull() ?: return null
-        return Bounds(x1, y1, x2, y2)
-    }
-
-    private fun encodeForAdbInputText(text: String): String {
-        val builder = StringBuilder()
-        text.forEach { char ->
-            when {
-                char.isLetterOrDigit() -> builder.append(char)
-                char == ' ' -> builder.append("%s")
-                char == '-' || char == '_' || char == '.' -> builder.append(char)
-                else -> builder.append('\\').append(char)
-            }
-        }
-        return builder.toString()
-    }
-
     private fun isProxyCleared(proxy: String, host: String, port: String, pac: String): Boolean {
         val proxyCleared = proxy.isBlank() || proxy == "null" || proxy == ":0"
         val hostCleared = host.isBlank() || host == "null"
@@ -613,12 +376,12 @@ internal class ProxyCommanderController(
         adbClient.run(args = listOf("start-server"), allowFailure = true)
     }
 
-    private class AdbClient(project: Project, adbPath: String) {
+    private class AdbClient(workingDirectory: File?, adbPath: String) {
         private val adbExecutable = when {
             adbPath.isNotBlank() -> adbPath
             else -> System.getenv("ADB").takeUnless { it.isNullOrBlank() } ?: "adb"
         }
-        private val workingDirectory = project.basePath?.let(::File)
+        private val workingDirectory = workingDirectory
         private val defaultTimeoutMs = 10_000L
 
         fun run(args: List<String>, allowFailure: Boolean = false, timeoutMs: Long = defaultTimeoutMs): CommandResult =
@@ -685,47 +448,7 @@ internal class ProxyCommanderController(
         }
     }
 
-    private data class ForegroundApp(
-        val packageName: String,
-        val activity: String
-    )
-
-    private data class PasswordFieldTarget(
-        val centerX: Int,
-        val centerY: Int,
-        val packageName: String,
-        val className: String,
-        val resourceId: String,
-        val text: String,
-        val hint: String,
-        val contentDesc: String,
-        val isPassword: Boolean,
-        val isClickable: Boolean,
-        val isFocusable: Boolean,
-        val isFocused: Boolean,
-        val score: Int = 0
-    ) {
-        val summary: String
-            get() = buildString {
-                append(resourceId.ifBlank { "<no-id>" })
-                append(", class=")
-                append(className.ifBlank { "<unknown>" })
-            }
-    }
-
-    private data class Bounds(
-        val first: Int,
-        val second: Int,
-        val third: Int,
-        val fourth: Int
-    )
-
     private companion object {
         val EMULATOR_SERIAL_REGEX = Regex("^emulator-[0-9]+$")
-        val FOREGROUND_RESUMED_REGEX = Regex("mResumedActivity:.*\\s([\\w.$]+)/(\\S+)")
-        val FOREGROUND_TOP_RESUMED_REGEX = Regex("topResumedActivity=.*\\s([\\w.$]+)/(\\S+)")
-        val FOREGROUND_FOCUS_REGEX = Regex("mCurrentFocus=.*\\s([\\w.$]+)/(\\S+)")
-        val BOUNDS_REGEX = Regex("\\[(\\d+),(\\d+)]\\[(\\d+),(\\d+)]")
-        val PASSWORD_KEYWORD_REGEX = Regex("password|passcode|pin")
     }
 }
