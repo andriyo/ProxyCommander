@@ -12,6 +12,7 @@ import com.intellij.openapi.fileChooser.FileChooserDescriptorFactory
 import com.intellij.openapi.project.DumbAwareAction
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.ui.DialogWrapper
+import com.intellij.openapi.ui.TextBrowseFolderListener
 import com.intellij.openapi.ui.TextFieldWithBrowseButton
 import com.intellij.openapi.ui.ValidationInfo
 import com.intellij.ui.components.JBLabel
@@ -378,10 +379,12 @@ private class ProxyCommanderSettingsDialog(
         title = "Proxy Commander Settings"
         adbPathField.text = currentConfig.adbPath
         adbPathField.addBrowseFolderListener(
-            "Select adb Executable",
-            "Choose adb executable from Android SDK platform-tools (optional)",
-            project,
-            FileChooserDescriptorFactory.createSingleFileNoJarsDescriptor()
+            TextBrowseFolderListener(
+                FileChooserDescriptorFactory.createSingleFileNoJarsDescriptor()
+                    .withTitle("Select adb Executable")
+                    .withDescription("Choose adb executable from Android SDK platform-tools (optional)"),
+                project
+            )
         )
         init()
     }
