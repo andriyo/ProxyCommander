@@ -30,6 +30,7 @@ import javax.swing.Action
 import javax.swing.Box
 import javax.swing.BoxLayout
 import javax.swing.JButton
+import javax.swing.JCheckBox
 import javax.swing.JComponent
 import javax.swing.JPanel
 
@@ -221,12 +222,14 @@ private object ProxyCommanderActionRunner {
 
             settings.updateConfig(
                 port = dialog.selectedPort(),
-                adbPath = dialog.selectedAdbPath()
+                adbPath = dialog.selectedAdbPath(),
+                resetTimeOnConnect = dialog.isResetTimeOnConnect()
             )
             val adbSummary = dialog.selectedAdbPath().ifBlank { "<PATH or \$ADB>" }
+            val resetSummary = if (dialog.isResetTimeOnConnect()) "on" else "off"
             notify(
                 project = project,
-                message = "Settings saved (port=${dialog.selectedPort()}, adb=$adbSummary).",
+                message = "Settings saved (port=${dialog.selectedPort()}, adb=$adbSummary, reset-time=$resetSummary).",
                 type = NotificationType.INFORMATION
             )
         }
@@ -368,10 +371,15 @@ private class ProxyCommanderSettingsDialog(
 
     private val portField = JBTextField(currentConfig.port.toString())
     private val adbPathField = TextFieldWithBrowseButton()
+    private val resetTimeCheckbox = JCheckBox(
+        "Reset device clock on connect (forces NTP resync)",
+        currentConfig.resetTimeOnConnect
+    )
     private val resetDefaultsAction = object : AbstractAction("Reset to Defaults") {
         override fun actionPerformed(event: ActionEvent) {
             portField.text = ProxyCommanderSettingsService.DEFAULT_PORT.toString()
             adbPathField.text = ""
+            resetTimeCheckbox.isSelected = true
         }
     }
 
@@ -394,6 +402,7 @@ private class ProxyCommanderSettingsDialog(
             .addLabeledComponent(JBLabel("Port:"), portField)
             .addLabeledComponent(JBLabel("ADB Path (optional):"), adbPathField)
             .addComponent(JBLabel("Leave ADB Path empty to use \$ADB or adb from PATH."))
+            .addComponent(resetTimeCheckbox)
             .panel
         panel.preferredSize = Dimension(620, panel.preferredSize.height)
         panel.border = JBUI.Borders.empty(8)
@@ -425,6 +434,8 @@ private class ProxyCommanderSettingsDialog(
     fun selectedPort(): Int = portField.text.trim().toInt()
 
     fun selectedAdbPath(): String = adbPathField.text.trim()
+
+    fun isResetTimeOnConnect(): Boolean = resetTimeCheckbox.isSelected
 }
 
 private class KeepEmulatorDialog(

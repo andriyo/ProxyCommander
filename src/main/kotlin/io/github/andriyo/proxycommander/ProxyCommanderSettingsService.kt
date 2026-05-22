@@ -12,7 +12,8 @@ class ProxyCommanderSettingsService : PersistentStateComponent<ProxyCommanderSet
 
     data class State(
         var port: Int = DEFAULT_PORT,
-        var adbPath: String = ""
+        var adbPath: String = "",
+        var resetTimeOnConnect: Boolean = true
     )
 
     private var state = State()
@@ -27,13 +28,15 @@ class ProxyCommanderSettingsService : PersistentStateComponent<ProxyCommanderSet
         val validPort = state.port.takeIf { it in 1..65535 } ?: DEFAULT_PORT
         return ProxyCommanderConfig(
             port = validPort,
-            adbPath = state.adbPath.trim()
+            adbPath = state.adbPath.trim(),
+            resetTimeOnConnect = state.resetTimeOnConnect
         )
     }
 
-    internal fun updateConfig(port: Int, adbPath: String) {
+    internal fun updateConfig(port: Int, adbPath: String, resetTimeOnConnect: Boolean) {
         state.port = port
         state.adbPath = adbPath.trim()
+        state.resetTimeOnConnect = resetTimeOnConnect
     }
 
     companion object {

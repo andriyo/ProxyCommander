@@ -6,7 +6,8 @@ import java.util.concurrent.TimeUnit
 
 internal data class ProxyCommanderConfig(
     val port: Int = ProxyCommanderSettingsService.DEFAULT_PORT,
-    val adbPath: String = ""
+    val adbPath: String = "",
+    val resetTimeOnConnect: Boolean = true
 )
 
 internal data class ConnectedDevice(
@@ -207,7 +208,19 @@ internal class ProxyCommanderController private constructor(
     private fun connectSerial(serial: String, log: (String) -> Unit): Boolean {
         val reverseEnabled = enableReverse(serial, log)
         val proxyConfigured = setDeviceProxy(serial, log)
+        if (config.resetTimeOnConnect) {
+            resetDeviceTime(serial, log)
+        }
         return reverseEnabled && proxyConfigured
+    }
+
+    private fun resetDeviceTime(serial: String, log: (String) -> Unit) {
+        val toggles = listOf("auto_time", "auto_time_zone")
+        toggles.forEach { key ->
+            adbClient.run(serial, listOf("shell", "settings", "put", "global", key, "0"), allowFailure = true)
+            adbClient.run(serial, listOf("shell", "settings", "put", "global", key, "1"), allowFailure = true)
+        }
+        log("[ProxyCommander] Requested clock and timezone resync for $serial (auto_time toggle)")
     }
 
     private fun disconnectSerial(serial: String, log: (String) -> Unit): Boolean {

@@ -96,6 +96,52 @@ class ProxyCommanderIntegrationTest {
     }
 
     @Test
+    fun connectAllDevices_resyncsDriftedClock() {
+        val devices = controller.listConnectedDevices(logs::add)
+        val emulators = devices.filter { it.isEmulator }
+        assumeTrue(emulators.isNotEmpty(), "At least one connected emulator is required.")
+        assumeTrue(runAdbRoot(), "adb root must succeed (rootable emulator image required).")
+
+        val target = emulators.first().serial
+        val driftSeconds = 30L * 60
+        val driftedReadings = emulators.associate { device ->
+            val driftPoint = System.currentTimeMillis() - driftSeconds * 1000
+            val formatted = formatDeviceDate(driftPoint)
+            val setResult = runAdb(serial = device.serial, args = listOf("shell", "date", formatted))
+            assumeTrue(setResult.exitCode == 0, "Could not drift clock on ${device.serial}: ${setResult.output}")
+            val readBack = readDeviceEpochSeconds(device.serial)
+            device.serial to readBack
+        }
+        runAdbUnroot()
+
+        val hostEpochBefore = System.currentTimeMillis() / 1000
+        driftedReadings.forEach { (serial, drifted) ->
+            val skew = hostEpochBefore - drifted
+            assertTrue(
+                skew >= driftSeconds - 10,
+                "Drift on $serial not applied (skew=${skew}s, expected ~${driftSeconds}s)"
+            )
+        }
+
+        try {
+            assertTrue(controller.connectAllDevices(logs::add), "connectAllDevices failed.\n${logs.joinToString("\n")}")
+            Thread.sleep(8_000)
+
+            val hostEpochAfter = System.currentTimeMillis() / 1000
+            emulators.forEach { device ->
+                val deviceEpoch = readDeviceEpochSeconds(device.serial)
+                val skewSeconds = kotlin.math.abs(hostEpochAfter - deviceEpoch)
+                assertTrue(
+                    skewSeconds <= 10,
+                    "Device ${device.serial} clock not resynced (skew=${skewSeconds}s after toggle)"
+                )
+            }
+        } finally {
+            controller.disconnectAllDevices {}
+        }
+    }
+
+    @Test
     fun connectOneAndDisconnectOthers_keepsOnlySelectedDeviceConnected() {
         val devices = controller.listConnectedDevices(logs::add)
         val emulators = devices.filter { it.isEmulator }
@@ -136,6 +182,34 @@ class ProxyCommanderIntegrationTest {
             localServer?.close()
             controller.disconnectAllDevices {}
         }
+    }
+
+    private fun runAdbRoot(): Boolean {
+        val result = runAdb(args = listOf("root"))
+        Thread.sleep(2_000)
+        return result.exitCode == 0 && result.output.contains("root", ignoreCase = true)
+    }
+
+    private fun runAdbUnroot() {
+        runAdb(args = listOf("unroot"))
+        Thread.sleep(2_000)
+    }
+
+    private fun formatDeviceDate(epochMillis: Long): String {
+        val formatter = java.text.SimpleDateFormat("MMddHHmmyyyy.ss").apply {
+            timeZone = java.util.TimeZone.getDefault()
+        }
+        return formatter.format(java.util.Date(epochMillis))
+    }
+
+    private fun readDeviceEpochSeconds(serial: String): Long {
+        val result = runAdb(serial = serial, args = listOf("shell", "date", "+%s"))
+        return result.output
+            .lineSequence()
+            .map { it.trim() }
+            .firstOrNull { it.matches(Regex("[0-9]+")) }
+            ?.toLong()
+            ?: 0L
     }
 
     private fun ensureLocalEndpointListening(port: Int): LocalProbeServer? {
