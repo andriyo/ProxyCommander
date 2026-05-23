@@ -5,7 +5,7 @@ plugins {
 }
 
 group = "io.github.andriyo"
-version = "1.1.0"
+version = "1.1.1"
 
 val androidStudioVersion = providers.gradleProperty("androidStudioVersion").orElse("2024.2.1.11")
 val androidStudioPath = providers.gradleProperty("androidStudioPath")
@@ -41,6 +41,12 @@ intellijPlatform {
         }
 
         changeNotes = """
+            <h3>1.1.1</h3>
+            <ul>
+              <li>Refreshed plugin icon.</li>
+              <li>Clearer action labels: "Connect Active Emulator and Clear Others' Proxy" and "Select Emulator and Disconnect Others".</li>
+              <li>Plugin description and README updates.</li>
+            </ul>
             <h3>1.1.0</h3>
             <ul>
               <li>New: reset the device clock on every connect by forcing an NTP resync (toggles <code>auto_time</code> and <code>auto_time_zone</code>). Useful when emulators or devices have drifted.</li>

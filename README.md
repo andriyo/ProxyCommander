@@ -1,16 +1,16 @@
 # ProxyCommander
 
-Android Studio plugin for quickly controlling `adb reverse` and device proxy setup across emulators/devices used in development.
+Android Studio plugin for quickly controlling `adb reverse`, device proxy setup, and optional device time resync across emulators/devices used in development.
 
 ## What it does
 
 - Connect all devices:
   - enables `adb reverse tcp:<port> tcp:<port>`
   - sets `settings global http_proxy localhost:<port>`
-- Connect active emulator and clear others proxy:
+- Connect active emulator and clear others' proxy:
   - detects active emulator from IDE context
   - connects proxy on that emulator
-  - clears proxy on all other connected devices
+  - clears proxy settings on all other connected devices
 - Disconnect all devices:
   - removes reverse mapping
   - clears proxy settings (including PAC)
@@ -24,6 +24,7 @@ Android Studio plugin for quickly controlling `adb reverse` and device proxy set
 
 - `Port` (default: `8888`)
 - `ADB Path` (optional, falls back to `$ADB` or `adb` in `PATH`)
+- `Reset device clock on connect` (enabled by default, toggles automatic time/timezone to force resync)
 
 ## Installation
 
@@ -52,7 +53,7 @@ cd /Users/andrii/IdeaProjects/ProxyCommander
 These tests call `ProxyCommanderController` methods directly and verify on connected devices that:
 
 - `Connect All` enables reverse + proxy
-- `Connect One and Disconnect Others` keeps only selected emulator connected
+- `Connect active emulator and clear others' proxy` keeps only the active emulator proxied
 - `Disconnect All` clears proxy/reverse
 - with connect enabled, devices can reach `http://0.0.0.0:<port>`
 - after disconnect, devices cannot reach `http://0.0.0.0:<port>` but can still reach internet hosts
@@ -71,7 +72,7 @@ Optional:
 
 - `Tools -> Proxy Commander`
 - Run toolbar (`ToolbarRunGroup`) near Android attach debugger actions
-- Running Devices secondary toolbar (`StreamingToolbarSecondary`) for supported actions
+- Running Devices secondary toolbar (`StreamingToolbarSecondary`) for supported quick actions
 
 ## Troubleshooting
 

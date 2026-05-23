@@ -57,8 +57,8 @@ class DisconnectAllDevicesAction : DumbAwareAction(
 }
 
 class KeepSelectedDeviceAction : DumbAwareAction(
-    "Select Device and Disconnect Others",
-    "Choose one connected device and disconnect all others",
+    "Select Emulator and Disconnect Others",
+    "Choose one connected emulator and disconnect all others",
     null
 ) {
     override fun actionPerformed(event: AnActionEvent) {
@@ -68,8 +68,8 @@ class KeepSelectedDeviceAction : DumbAwareAction(
 }
 
 class ConnectActiveEmulatorClearOthersProxyAction : DumbAwareAction(
-    "Connect One and Disconnect Others",
-    "Enable reverse+proxy for active emulator and clear proxy on all other connected devices",
+    "Connect Active Emulator and Clear Others' Proxy",
+    "Enable reverse/proxy for active emulator and clear proxy settings on all other connected devices",
     AllIcons.Actions.Execute
 ) {
     override fun update(event: AnActionEvent) {
