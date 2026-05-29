@@ -4,26 +4,43 @@ Android Studio plugin for quickly controlling `adb reverse`, device proxy setup,
 
 ## What it does
 
-- Connect all devices:
+- Connect Proxy to All Devices:
   - enables `adb reverse tcp:<port> tcp:<port>`
   - sets `settings global http_proxy localhost:<port>`
-- Connect active emulator and clear others' proxy:
+- Connect Proxy to Current and Disconnect Others:
   - detects active emulator from IDE context
   - connects proxy on that emulator
-  - clears proxy settings on all other connected devices
-- Disconnect all devices:
+  - clears proxy settings on all other available devices
+- Disconnect Proxy from All Devices:
   - removes reverse mapping
   - clears proxy settings (including PAC)
-- Select emulator and disconnect others:
-  - shows connected emulator list
-  - keeps one connected and disconnects all others
+- Devices...:
+  - lists available devices alongside remembered auto-connect targets
+  - shows connection and proxy status, plus API level and serial
+  - per-device actions: proxy, proxy only this device, and a host-proxy connection test
+  - bulk Proxy All / Unproxy All
+
+## Auto-reconnect
+
+Devices that you connect (via the actions or the Devices dialog) are remembered. A background
+watcher tracks `adb` device snapshots, and when a remembered device reappears — for example
+after a reboot or emulator restart — the plugin waits for it to finish booting and re-applies
+the reverse mapping and proxy automatically. Disconnecting all devices clears the remembered set.
+
+## Connection testing
+
+The Devices dialog can verify a device end-to-end: it confirms the device proxy points at
+`localhost:<port>`, the reverse mapping is enabled, and a supported host proxy (Charles or
+Proxyman) is actually listening on `<port>`.
 
 ## Settings
 
 `Tools -> Proxy Commander -> Settings...`
 
 - `Port` (default: `8888`)
-- `ADB Path` (optional, falls back to `$ADB` or `adb` in `PATH`)
+- `ADB Path` (optional). When empty, adb is resolved in order: `$ADB`, the Android SDK
+  (`local.properties` `sdk.dir`, `ANDROID_SDK_ROOT`, `ANDROID_HOME`, or standard SDK
+  locations), then `adb` on `PATH`.
 - `Reset device clock on connect` (enabled by default, toggles automatic time/timezone to force resync)
 
 ## Installation

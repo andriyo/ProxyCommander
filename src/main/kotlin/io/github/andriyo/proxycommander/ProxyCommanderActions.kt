@@ -12,20 +12,25 @@ import com.intellij.openapi.fileChooser.FileChooserDescriptorFactory
 import com.intellij.openapi.project.DumbAwareAction
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.ui.DialogWrapper
+import com.intellij.openapi.ui.Messages
 import com.intellij.openapi.ui.TextBrowseFolderListener
 import com.intellij.openapi.ui.TextFieldWithBrowseButton
 import com.intellij.openapi.ui.ValidationInfo
+import com.intellij.openapi.util.IconLoader
 import com.intellij.ui.components.JBLabel
 import com.intellij.ui.components.JBScrollPane
 import com.intellij.ui.components.JBTextField
 import com.intellij.util.ui.FormBuilder
 import com.intellij.util.ui.JBUI
 import java.awt.BorderLayout
+import java.awt.Component
+import java.awt.Container
 import java.awt.Dimension
 import java.awt.FlowLayout
 import java.awt.event.ActionEvent
 import java.io.File
 import javax.swing.AbstractAction
+import javax.swing.AbstractButton
 import javax.swing.Action
 import javax.swing.Box
 import javax.swing.BoxLayout
@@ -35,8 +40,8 @@ import javax.swing.JComponent
 import javax.swing.JPanel
 
 class ConnectAllDevicesAction : DumbAwareAction(
-    "Connect All",
-    "Enable reverse proxy and HTTP proxy on all connected devices",
+    "Connect Proxy to All Devices",
+    "Enable reverse proxy and HTTP proxy on all available devices",
     null
 ) {
     override fun actionPerformed(event: AnActionEvent) {
@@ -46,8 +51,8 @@ class ConnectAllDevicesAction : DumbAwareAction(
 }
 
 class DisconnectAllDevicesAction : DumbAwareAction(
-    "Disconnect All",
-    "Disable reverse proxy and clear HTTP proxy on all connected devices",
+    "Disconnect Proxy from All Devices",
+    "Disable reverse proxy and clear HTTP proxy on all available devices",
     null
 ) {
     override fun actionPerformed(event: AnActionEvent) {
@@ -57,19 +62,19 @@ class DisconnectAllDevicesAction : DumbAwareAction(
 }
 
 class KeepSelectedDeviceAction : DumbAwareAction(
-    "Select Emulator and Disconnect Others",
-    "Choose one connected emulator and disconnect all others",
+    "Devices...",
+    "Manage device connections and auto-connect behavior",
     null
 ) {
     override fun actionPerformed(event: AnActionEvent) {
         val project = event.project ?: return
-        ProxyCommanderActionRunner.runKeepSelected(project)
+        ProxyCommanderActionRunner.runDevices(project)
     }
 }
 
 class ConnectActiveEmulatorClearOthersProxyAction : DumbAwareAction(
-    "Connect Active Emulator and Clear Others' Proxy",
-    "Enable reverse/proxy for active emulator and clear proxy settings on all other connected devices",
+    "Connect Proxy to Current and Disconnect Others",
+    "Enable reverse proxy for the current emulator and disconnect proxy from all other available devices",
     AllIcons.Actions.Execute
 ) {
     override fun update(event: AnActionEvent) {
@@ -165,49 +170,60 @@ private object ProxyCommanderStreamingContextResolver {
 
 private object ProxyCommanderActionRunner {
     fun runConnectAll(project: Project) {
+        val settings = ProxyCommanderSettingsService.getInstance(project)
         runBulkWithEmulatorSummary(
             project = project,
-            actionName = "Connect all devices"
+            actionName = "Connect proxy to all devices"
         ) { controller, log ->
-            controller.connectAllDevices(log)
+            val success = controller.connectAllDevices(log)
+            if (success) {
+                settings.rememberDevices(controller.listConnectedDeviceDetails(log).map { RememberedDevice(it.identifier, it.name) })
+                ProxyCommanderReconnectService.getInstance(project).refreshTracking()
+            }
+            success
         }
     }
 
     fun runDisconnectAll(project: Project) {
+        val settings = ProxyCommanderSettingsService.getInstance(project)
         runBulkWithEmulatorSummary(
             project = project,
-            actionName = "Disconnect all devices"
+            actionName = "Disconnect proxy from all devices"
         ) { controller, log ->
-            controller.disconnectAllDevices(log)
+            val success = controller.disconnectAllDevices(log)
+            if (success) {
+                settings.clearRememberedDevices()
+                ProxyCommanderReconnectService.getInstance(project).refreshTracking()
+            }
+            success
         }
     }
 
-    fun runKeepSelected(project: Project) {
-        val config = ProxyCommanderSettingsService.getInstance(project).getConfig()
+    fun runDevices(project: Project) {
+        val settings = ProxyCommanderSettingsService.getInstance(project)
         ApplicationManager.getApplication().invokeLater {
-            val dialog = KeepEmulatorDialog(project, config)
-            if (!dialog.showAndGet()) {
-                return@invokeLater
-            }
-
-            val selectedSerial = dialog.selectedSerial ?: return@invokeLater
-            runInBackground(
-                project = project,
-                actionName = "Disconnect all devices except $selectedSerial"
-            ) { controller, log ->
-                controller.keepOnlyDevice(selectedSerial, log)
-            }
+            DevicesDialog(project, settings).show()
         }
     }
 
     fun runConnectActiveEmulatorAndClearOthersProxy(project: Project, target: StreamingTarget?) {
+        val settings = ProxyCommanderSettingsService.getInstance(project)
         runInBackground(
             project = project,
-            actionName = "Connect active emulator and clear proxy on other devices"
+            actionName = "Connect proxy to current emulator and disconnect proxy from other devices"
         ) { controller, log ->
             val activeSerial = resolveActiveEmulatorSerial(target, controller, log)
                 ?: return@runInBackground false
-            controller.connectEmulatorAndClearProxyOnOthers(activeSerial, log)
+            val success = controller.connectEmulatorAndClearProxyOnOthers(activeSerial, log)
+            if (success) {
+                val remembered = controller.listConnectedDeviceDetails(log)
+                    .firstOrNull { it.serial == activeSerial }
+                    ?.let { RememberedDevice(it.identifier, it.name) }
+                    ?: RememberedDevice(activeSerial, activeSerial)
+                settings.replaceRememberedDevices(listOf(remembered))
+                ProxyCommanderReconnectService.getInstance(project).refreshTracking()
+            }
+            success
         }
     }
 
@@ -225,6 +241,7 @@ private object ProxyCommanderActionRunner {
                 adbPath = dialog.selectedAdbPath(),
                 resetTimeOnConnect = dialog.isResetTimeOnConnect()
             )
+            ProxyCommanderReconnectService.getInstance(project).refreshTracking()
             val adbSummary = dialog.selectedAdbPath().ifBlank { "<PATH or \$ADB>" }
             val resetSummary = if (dialog.isResetTimeOnConnect()) "on" else "off"
             notify(
@@ -244,11 +261,15 @@ private object ProxyCommanderActionRunner {
         ApplicationManager.getApplication().executeOnPooledThread {
             val logs = mutableListOf<String>()
             val controller = ProxyCommanderController(project, config)
-            val success = runCatching {
-                operation(controller, logs::add)
-            }.getOrElse { error ->
-                logs += "[ProxyCommander] Error: ${error.message}"
+            val success = if (!controller.ensureAdbAvailable(logs::add)) {
                 false
+            } else {
+                runCatching {
+                    operation(controller, logs::add)
+                }.getOrElse { error ->
+                    logs += "[ProxyCommander] Error: ${error.message}"
+                    false
+                }
             }
 
             val fallback = if (success) {
@@ -273,12 +294,21 @@ private object ProxyCommanderActionRunner {
         ApplicationManager.getApplication().executeOnPooledThread {
             val logs = mutableListOf<String>()
             val controller = ProxyCommanderController(project, config)
-            val targetedEmulators = controller.listConnectedEmulators(logs::add)
-            val success = runCatching {
-                operation(controller, logs::add)
-            }.getOrElse { error ->
-                logs += "[ProxyCommander] Error: ${error.message}"
+            val adbAvailable = controller.ensureAdbAvailable(logs::add)
+            val targetedEmulators = if (adbAvailable) {
+                controller.listConnectedEmulators(logs::add)
+            } else {
+                emptyList()
+            }
+            val success = if (!adbAvailable) {
                 false
+            } else {
+                runCatching {
+                    operation(controller, logs::add)
+                }.getOrElse { error ->
+                    logs += "[ProxyCommander] Error: ${error.message}"
+                    false
+                }
             }
 
             val actionSummary = if (success) {
@@ -286,9 +316,13 @@ private object ProxyCommanderActionRunner {
             } else {
                 "$actionName failed."
             }
-            val emulatorSummary = emulatorSummary(targetedEmulators)
-            val base = summarize(logs, actionSummary)
-            val message = "$base $emulatorSummary".trim()
+            val message = if (adbAvailable) {
+                val emulatorSummary = emulatorSummary(targetedEmulators)
+                val base = summarize(logs, actionSummary)
+                "$base $emulatorSummary".trim()
+            } else {
+                summarize(logs, actionSummary)
+            }
             notify(
                 project = project,
                 message = message,
@@ -401,7 +435,7 @@ private class ProxyCommanderSettingsDialog(
         val panel = FormBuilder.createFormBuilder()
             .addLabeledComponent(JBLabel("Port:"), portField)
             .addLabeledComponent(JBLabel("ADB Path (optional):"), adbPathField)
-            .addComponent(JBLabel("Leave ADB Path empty to use \$ADB or adb from PATH."))
+            .addComponent(JBLabel("Leave ADB Path empty to use \$ADB, autodetect from the Android SDK, or fall back to adb from PATH."))
             .addComponent(resetTimeCheckbox)
             .panel
         panel.preferredSize = Dimension(620, panel.preferredSize.height)
@@ -438,78 +472,283 @@ private class ProxyCommanderSettingsDialog(
     fun isResetTimeOnConnect(): Boolean = resetTimeCheckbox.isSelected
 }
 
-private class KeepEmulatorDialog(
+private data class DeviceDialogEntry(
+    val id: String,
+    val name: String,
+    val apiLevel: String,
+    val serial: String?,
+    val connected: Boolean,
+    val proxyConnected: Boolean,
+    val remembered: Boolean
+)
+
+private class DevicesDialog(
     private val project: Project,
-    private val config: ProxyCommanderConfig
+    private val settings: ProxyCommanderSettingsService
 ) : DialogWrapper(project) {
 
-    private val emulatorsPanel = JPanel()
-    private val statusLabel = JBLabel("Loading connected emulators...")
+    private val devicesPanel = JPanel()
+    private val statusLabel = JBLabel("Loading devices...")
     private val refreshButton = JButton("Refresh")
-
-    var selectedSerial: String? = null
-        private set
+    private val connectAllButton = JButton("Proxy All", CONNECT_ALL_ICON)
+    private val disconnectAllButton = JButton("Unproxy All", DISCONNECT_ALL_ICON)
 
     init {
-        title = "Select Emulator and Disconnect Others"
+        title = "Devices"
+        cancelAction.putValue(Action.NAME, "Close")
         init()
-        reloadEmulators()
+        refreshButton.addActionListener { reloadDevices() }
+        connectAllButton.addActionListener { connectAllDevices() }
+        disconnectAllButton.addActionListener { disconnectAllDevices() }
+        reloadDevices()
     }
 
     override fun createCenterPanel(): JComponent {
         val root = JPanel(BorderLayout(0, 8))
-        root.preferredSize = Dimension(640, 320)
+        root.preferredSize = Dimension(820, 420)
         root.border = JBUI.Borders.empty(8)
 
-        val topRow = JPanel(FlowLayout(FlowLayout.LEFT, 8, 0))
-        topRow.add(JBLabel("Choose emulator to keep connected:"))
-        topRow.add(refreshButton)
-        refreshButton.addActionListener { reloadEmulators() }
-        root.add(topRow, BorderLayout.NORTH)
+        val controls = JPanel(FlowLayout(FlowLayout.LEFT, 8, 0))
+        controls.add(JBLabel("Available devices and remembered reconnect targets"))
+        controls.add(connectAllButton)
+        controls.add(disconnectAllButton)
+        controls.add(refreshButton)
+        root.add(controls, BorderLayout.NORTH)
 
-        emulatorsPanel.layout = BoxLayout(emulatorsPanel, BoxLayout.Y_AXIS)
-        emulatorsPanel.border = JBUI.Borders.empty(6)
-        root.add(JBScrollPane(emulatorsPanel), BorderLayout.CENTER)
+        devicesPanel.layout = BoxLayout(devicesPanel, BoxLayout.Y_AXIS)
+        devicesPanel.border = JBUI.Borders.empty(6)
+        root.add(JBScrollPane(devicesPanel), BorderLayout.CENTER)
         root.add(statusLabel, BorderLayout.SOUTH)
         return root
     }
 
     override fun createActions(): Array<Action> = arrayOf(cancelAction)
 
-    private fun reloadEmulators() {
-        refreshButton.isEnabled = false
-        statusLabel.text = "Loading connected emulators..."
-        emulatorsPanel.removeAll()
-        emulatorsPanel.add(JBLabel("Loading..."))
-        emulatorsPanel.revalidate()
-        emulatorsPanel.repaint()
-
+    private fun reloadDevices(statusOverride: String? = null) {
+        setLoadingState("Loading devices...")
         ApplicationManager.getApplication().executeOnPooledThread {
-            val emulators = runCatching {
-                val controller = ProxyCommanderController(project, config)
-                controller.listConnectedEmulators()
-            }.getOrElse { error ->
-                ApplicationManager.getApplication().invokeLater(
-                    {
-                        emulatorsPanel.removeAll()
-                        emulatorsPanel.add(JBLabel("Failed to load emulators: ${error.message.orEmpty()}"))
-                        emulatorsPanel.revalidate()
-                        emulatorsPanel.repaint()
-                        refreshButton.isEnabled = true
-                        statusLabel.text = "Failed to load connected emulators."
-                    },
-                    ModalityState.any()
-                )
-                return@executeOnPooledThread
+            val remembered = settings.getRememberedDevices()
+            val logs = mutableListOf<String>()
+            val controller = ProxyCommanderController(project, settings.getConfig())
+            val connectedDevices = if (controller.ensureAdbAvailable(logs::add)) {
+                controller.listConnectedDeviceDetails(logs::add)
+            } else {
+                null
+            }
+
+            val entries = buildEntries(remembered, connectedDevices)
+            val status = statusOverride ?: when {
+                connectedDevices == null -> summarizeLogs(logs, "ADB command is not available.")
+                connectedDevices.isEmpty() && entries.isEmpty() -> "No devices available."
+                else -> "Available: ${connectedDevices.size}. Remembered: ${remembered.size}."
             }
 
             ApplicationManager.getApplication().invokeLater(
                 {
-                    renderEmulators(emulators)
+                    renderDevices(entries)
                     refreshButton.isEnabled = true
-                    statusLabel.text = when {
-                        emulators.isEmpty() -> "No connected emulators."
-                        else -> "Connected emulators: ${emulators.size}"
+                    connectAllButton.isEnabled = true
+                    disconnectAllButton.isEnabled = true
+                    statusLabel.text = status
+                },
+                ModalityState.any()
+            )
+        }
+    }
+
+    private fun buildEntries(
+        remembered: List<RememberedDevice>,
+        connectedDevices: List<ConnectedDeviceDetails>?
+    ): List<DeviceDialogEntry> {
+        val rememberedById = remembered.associateBy { it.id }.toMutableMap()
+        val connectedById = (connectedDevices ?: emptyList()).associateBy { it.identifier }
+        connectedDevices.orEmpty().forEach { connected ->
+            rememberedById.putIfAbsent(connected.identifier, RememberedDevice(connected.identifier, connected.name))
+        }
+
+        return rememberedById.values
+            .map { device ->
+                val connected = connectedById[device.id]
+                DeviceDialogEntry(
+                    id = device.id,
+                    name = connected?.name ?: device.name,
+                    apiLevel = connected?.apiLevel ?: "?",
+                    serial = connected?.serial,
+                    connected = connected != null,
+                    proxyConnected = connected?.isProxyConnected == true,
+                    remembered = remembered.any { it.id == device.id }
+                )
+            }
+            .plus(
+                connectedDevices.orEmpty()
+                    .filter { connected -> connected.identifier !in rememberedById }
+                    .map {
+                        DeviceDialogEntry(
+                            id = it.identifier,
+                            name = it.name,
+                            apiLevel = it.apiLevel,
+                            serial = it.serial,
+                            connected = true,
+                            proxyConnected = it.isProxyConnected,
+                            remembered = false
+                        )
+                    }
+            )
+            .sortedWith(
+                compareByDescending<DeviceDialogEntry> { it.connected }
+                    .thenBy { it.name.lowercase() }
+                    .thenBy { it.id }
+            )
+    }
+
+    private fun setLoadingState(message: String) {
+        refreshButton.isEnabled = false
+        connectAllButton.isEnabled = false
+        disconnectAllButton.isEnabled = false
+        devicesPanel.removeAll()
+        devicesPanel.add(JBLabel(message))
+        devicesPanel.revalidate()
+        devicesPanel.repaint()
+        statusLabel.text = message
+    }
+
+    private fun setOperationInProgress(message: String) {
+        refreshButton.isEnabled = false
+        connectAllButton.isEnabled = false
+        disconnectAllButton.isEnabled = false
+        setButtonsEnabled(devicesPanel, false)
+        statusLabel.text = message
+    }
+
+    private fun connectAllDevices() {
+        runOperation(
+            busyMessage = "Proxying all devices...",
+            fallbackSuccess = "Proxy connected to all available devices.",
+            fallbackFailure = "Failed to connect proxy to all available devices."
+        ) { controller, log ->
+            val success = controller.connectAllDevices(log)
+            if (success) {
+                settings.rememberDevices(
+                    controller.listConnectedDeviceDetails(log).map { RememberedDevice(it.identifier, it.name) }
+                )
+                ProxyCommanderReconnectService.getInstance(project).refreshTracking()
+            }
+            success
+        }
+    }
+
+    private fun disconnectAllDevices() {
+        runOperation(
+            busyMessage = "Removing proxy from all devices...",
+            fallbackSuccess = "Proxy disconnected from all available devices.",
+            fallbackFailure = "Failed to disconnect proxy from all available devices."
+        ) { controller, log ->
+            val success = controller.disconnectAllDevices(log)
+            if (success) {
+                settings.clearRememberedDevices()
+                ProxyCommanderReconnectService.getInstance(project).refreshTracking()
+            }
+            success
+        }
+    }
+
+    private fun connectDevice(entry: DeviceDialogEntry) {
+        runOperation(
+            busyMessage = "Connecting proxy to ${entry.id}...",
+            fallbackSuccess = "Proxy connected to ${entry.id}.",
+            fallbackFailure = "Failed to connect proxy to ${entry.id}."
+        ) { controller, log ->
+            val serial = entry.serial ?: return@runOperation false
+            val success = controller.connectDevice(serial, log)
+            if (success) {
+                settings.rememberDevices(listOf(RememberedDevice(entry.id, entry.name)))
+                ProxyCommanderReconnectService.getInstance(project).refreshTracking()
+            }
+            success
+        }
+    }
+
+    private fun connectOnlyDevice(entry: DeviceDialogEntry) {
+        runOperation(
+            busyMessage = "Connecting proxy only to ${entry.id}...",
+            fallbackSuccess = "Proxy connected only to ${entry.id}.",
+            fallbackFailure = "Failed to connect proxy only to ${entry.id}."
+        ) { controller, log ->
+            val serial = entry.serial ?: return@runOperation false
+            val success = controller.keepOnlyDevice(serial, log)
+            if (success) {
+                settings.replaceRememberedDevices(listOf(RememberedDevice(entry.id, entry.name)))
+                ProxyCommanderReconnectService.getInstance(project).refreshTracking()
+            }
+            success
+        }
+    }
+
+    private fun testConnection(entry: DeviceDialogEntry) {
+        runOperation(
+            busyMessage = "Testing ${entry.id}...",
+            fallbackSuccess = "Test connection completed for ${entry.id}.",
+            fallbackFailure = "Test connection failed for ${entry.id}.",
+            showDialogOnCompletion = true,
+            showNotificationOnCompletion = false
+        ) { controller, log ->
+            val serial = entry.serial ?: return@runOperation false
+            controller.testProxyConnection(serial, log)
+        }
+    }
+
+    private fun runOperation(
+        busyMessage: String,
+        fallbackSuccess: String,
+        fallbackFailure: String,
+        reloadAfter: Boolean = true,
+        showDialogOnCompletion: Boolean = false,
+        showNotificationOnCompletion: Boolean = true,
+        operation: (ProxyCommanderController, (String) -> Unit) -> Boolean
+    ) {
+        setOperationInProgress(busyMessage)
+        ApplicationManager.getApplication().executeOnPooledThread {
+            val logs = mutableListOf<String>()
+            val controller = ProxyCommanderController(project, settings.getConfig())
+            val success = if (!controller.ensureAdbAvailable(logs::add)) {
+                false
+            } else {
+                runCatching {
+                    operation(controller, logs::add)
+                }.getOrElse { error ->
+                    logs += "[ProxyCommander] Error: ${error.message}"
+                    false
+                }
+            }
+            val message = summarizeLogs(logs, if (success) fallbackSuccess else fallbackFailure)
+            ApplicationManager.getApplication().invokeLater(
+                {
+                    if (showNotificationOnCompletion) {
+                        Notifications.Bus.notify(
+                            Notification(
+                                "ProxyCommander",
+                                "ProxyCommander",
+                                message,
+                                if (success) NotificationType.INFORMATION else NotificationType.ERROR
+                            ),
+                            project
+                        )
+                    }
+                    if (showDialogOnCompletion) {
+                        if (success) {
+                            Messages.showInfoMessage(project, message, "ProxyCommander")
+                        } else {
+                            Messages.showErrorDialog(project, message, "ProxyCommander")
+                        }
+                    }
+                    if (reloadAfter) {
+                        reloadDevices(message)
+                    } else {
+                        setButtonsEnabled(devicesPanel, true)
+                        refreshButton.isEnabled = true
+                        connectAllButton.isEnabled = true
+                        disconnectAllButton.isEnabled = true
+                        statusLabel.text = message
                     }
                 },
                 ModalityState.any()
@@ -517,32 +756,84 @@ private class KeepEmulatorDialog(
         }
     }
 
-    private fun renderEmulators(emulators: List<ConnectedEmulator>) {
-        emulatorsPanel.removeAll()
-        if (emulators.isEmpty()) {
-            emulatorsPanel.add(JBLabel("No connected emulators."))
+    private fun summarizeLogs(logs: List<String>, fallback: String): String {
+        val lastLog = logs.lastOrNull { it.isNotBlank() }?.removePrefix("[ProxyCommander] ")?.trim()
+        return lastLog.takeUnless { it.isNullOrBlank() } ?: fallback
+    }
+
+    private fun renderDevices(entries: List<DeviceDialogEntry>) {
+        devicesPanel.removeAll()
+        if (entries.isEmpty()) {
+            devicesPanel.add(JBLabel("No devices found. Connect a device or use Proxy Commander actions first."))
         } else {
-            emulators.forEach { emulator ->
+            entries.forEach { entry ->
                 val row = JPanel(BorderLayout(8, 0))
-                row.border = JBUI.Borders.empty(2, 0)
+                row.border = JBUI.Borders.empty(4, 0)
                 row.alignmentX = 0f
 
-                val labelText = "${emulator.avdName}  (${emulator.model})  [${emulator.serial}]"
-                row.add(JBLabel(labelText), BorderLayout.CENTER)
-
-                val keepButton = JButton("Keep This (Disconnect Others)")
-                keepButton.addActionListener {
-                    selectedSerial = emulator.serial
-                    close(OK_EXIT_CODE)
+                val infoText = buildString {
+                    append("<html><b>")
+                    append(entry.name)
+                    append("</b> &nbsp; <code>")
+                    append("API ")
+                    append(entry.apiLevel)
+                    append("</code> &nbsp; <code>")
+                    append(entry.serial ?: "serial unavailable")
+                    append("</code>")
+                    append("<br/>Status: ")
+                    append(if (entry.connected) "Available" else "Unavailable")
+                    append(" | Proxy: ")
+                    append(if (entry.proxyConnected) "Connected" else "Not Connected")
+                    if (entry.remembered) {
+                        append(" | Auto-connect enabled")
+                    }
+                    append("</html>")
                 }
-                row.add(keepButton, BorderLayout.EAST)
-                row.maximumSize = Dimension(Int.MAX_VALUE, maxOf(row.preferredSize.height, 28))
+                row.add(JBLabel(infoText), BorderLayout.CENTER)
 
-                emulatorsPanel.add(row)
-                emulatorsPanel.add(Box.createVerticalStrut(4))
+                val actions = JPanel(FlowLayout(FlowLayout.RIGHT, 6, 0))
+                val connectButton = JButton("Proxy", CONNECT_SINGLE_ICON)
+                connectButton.isEnabled = entry.connected
+                connectButton.addActionListener { connectDevice(entry) }
+                actions.add(connectButton)
+
+                val connectOnlyButton = JButton("Proxy only this", CONNECT_CURRENT_ICON)
+                connectOnlyButton.isEnabled = entry.connected
+                connectOnlyButton.addActionListener { connectOnlyDevice(entry) }
+                actions.add(connectOnlyButton)
+
+                val testButton = JButton("Test", TEST_ICON)
+                testButton.isEnabled = entry.connected
+                testButton.addActionListener { testConnection(entry) }
+                actions.add(testButton)
+
+                row.add(actions, BorderLayout.EAST)
+                row.maximumSize = Dimension(Int.MAX_VALUE, maxOf(row.preferredSize.height, 56))
+
+                devicesPanel.add(row)
+                devicesPanel.add(Box.createVerticalStrut(4))
             }
         }
-        emulatorsPanel.revalidate()
-        emulatorsPanel.repaint()
+        devicesPanel.revalidate()
+        devicesPanel.repaint()
+    }
+
+    private fun setButtonsEnabled(component: Component, enabled: Boolean) {
+        if (component is AbstractButton) {
+            component.isEnabled = enabled
+        }
+        if (component is Container) {
+            component.components.forEach { child ->
+                setButtonsEnabled(child, enabled)
+            }
+        }
+    }
+
+    private companion object {
+        val CONNECT_ALL_ICON = IconLoader.getIcon("/icons/proxy_connect_all.svg", DevicesDialog::class.java)
+        val DISCONNECT_ALL_ICON = IconLoader.getIcon("/icons/proxy_disconnect_all.svg", DevicesDialog::class.java)
+        val CONNECT_SINGLE_ICON = IconLoader.getIcon("/icons/proxy_connect_all.svg", DevicesDialog::class.java)
+        val CONNECT_CURRENT_ICON = IconLoader.getIcon("/icons/proxy_connect_active.svg", DevicesDialog::class.java)
+        val TEST_ICON = AllIcons.Actions.Help
     }
 }
