@@ -5,7 +5,7 @@ plugins {
 }
 
 group = "io.github.andriyo"
-version = "1.1.1"
+version = "1.2.0"
 
 val androidStudioVersion = providers.gradleProperty("androidStudioVersion").orElse("2024.2.1.11")
 val androidStudioPath = providers.gradleProperty("androidStudioPath")
@@ -41,6 +41,16 @@ intellijPlatform {
         }
 
         changeNotes = """
+            <h3>1.2.0</h3>
+            <ul>
+              <li>New: <b>auto-reconnect</b> remembered devices when they reappear. A background <code>adb track-devices</code> watcher restores reverse/proxy without a manual action.</li>
+              <li>New: <b>Devices dialog</b> for per-device proxy/test/auto-connect management.</li>
+              <li>New: <b>host-proxy connection test</b> that verifies the device can reach your local Charles/Proxyman/mitmproxy.</li>
+              <li>New: notification offering to connect a newly-appeared unremembered device (devices present at startup form a silent baseline).</li>
+              <li>Better: clock reset now uses <code>time_detector</code> to align directly to host wall-clock time, so it works on offline workstations without NTP reachability.</li>
+              <li>Better: broader <code>adb</code> autodetection from the Android SDK.</li>
+              <li>Better: clearer action labels; shorter variants on the Running Devices toolbar.</li>
+            </ul>
             <h3>1.1.1</h3>
             <ul>
               <li>Refreshed plugin icon.</li>
