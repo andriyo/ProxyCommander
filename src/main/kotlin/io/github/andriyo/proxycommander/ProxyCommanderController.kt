@@ -221,6 +221,62 @@ internal class ProxyCommanderController private constructor(
             adbClient.run(serial, listOf("shell", "settings", "put", "global", key, "1"), allowFailure = true)
         }
         log("[ProxyCommander] Requested clock and timezone resync for $serial (auto_time toggle)")
+        forceDeviceTimeFromHost(serial, log)
+    }
+
+    // Directly aligns the device clock to the host wall clock via time_detector. Unlike the
+    // auto_time toggle (which only helps when NTP is reachable), this works offline and does
+    // not require root, so it is the more reliable path on a developer machine.
+    private fun forceDeviceTimeFromHost(serial: String, log: (String) -> Unit) {
+        val before = System.currentTimeMillis()
+        val uptimeResult = adbClient.run(serial, listOf("shell", "cat", "/proc/uptime"), allowFailure = true)
+        val after = System.currentTimeMillis()
+
+        val elapsedMs = parseUptimeMillis(uptimeResult.output)
+        if (elapsedMs == null) {
+            log("[ProxyCommander] Skipped time_detector sync for $serial (could not read /proc/uptime: ${uptimeResult.briefOutput()})")
+            return
+        }
+
+        // Pair the device's elapsed-realtime reading with the host epoch sampled at the midpoint
+        // of the adb round trip, the closest single estimate of the matching wall-clock instant.
+        val hostEpochMs = (before + after) / 2
+        val reference = listOf(
+            "--elapsed_realtime", elapsedMs.toString(),
+            "--unix_epoch_time", hostEpochMs.toString()
+        )
+
+        adbClient.run(
+            serial,
+            listOf("shell", "cmd", "time_detector", "set_time_state_for_tests") + reference +
+                listOf("--user_should_confirm_time", "false"),
+            allowFailure = true
+        )
+        adbClient.run(
+            serial,
+            listOf("shell", "cmd", "time_detector", "confirm_time") + reference,
+            allowFailure = true
+        )
+
+        val stateResult = adbClient.run(
+            serial,
+            listOf("shell", "cmd", "time_detector", "get_time_state"),
+            allowFailure = true
+        )
+        val state = stateResult.output.lineSequence().firstOrNull { it.isNotBlank() }?.trim().orEmpty()
+        log("[ProxyCommander] Forced clock on $serial to host time via time_detector (epoch=${hostEpochMs}ms); state=${state.ifBlank { "<unavailable>" }}")
+    }
+
+    private fun parseUptimeMillis(output: String): Long? {
+        val seconds = output
+            .lineSequence()
+            .map { it.trim() }
+            .firstOrNull { it.isNotEmpty() }
+            ?.split(Regex("\\s+"))
+            ?.firstOrNull()
+            ?.toDoubleOrNull()
+            ?: return null
+        return (seconds * 1000).toLong()
     }
 
     private fun disconnectSerial(serial: String, log: (String) -> Unit): Boolean {
