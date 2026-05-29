@@ -27,6 +27,12 @@ watcher tracks `adb` device snapshots, and when a remembered device reappears â€
 after a reboot or emulator restart â€” the plugin waits for it to finish booting and re-applies
 the reverse mapping and proxy automatically. Disconnecting all devices clears the remembered set.
 
+When a device that is *not* remembered newly appears, the plugin shows a non-intrusive
+notification offering to connect it to the proxy. Ignoring the notification leaves the device
+untouched; choosing **Connect to Proxy** connects it and remembers it, so it auto-reconnects
+from then on. Devices already connected when the project opens form a baseline and are not
+offered, to avoid notification noise at startup.
+
 ## Connection testing
 
 The Devices dialog can verify a device end-to-end: it confirms the device proxy points at

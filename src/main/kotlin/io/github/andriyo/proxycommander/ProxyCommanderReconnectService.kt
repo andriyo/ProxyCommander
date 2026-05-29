@@ -1,6 +1,7 @@
 package io.github.andriyo.proxycommander
 
 import com.intellij.notification.Notification
+import com.intellij.notification.NotificationAction
 import com.intellij.notification.NotificationType
 import com.intellij.notification.Notifications
 import com.intellij.openapi.application.ApplicationManager
@@ -16,6 +17,8 @@ class ProxyCommanderReconnectService(private val project: Project) {
     private val disposed = AtomicBoolean(false)
     private val generation = AtomicInteger(0)
     private val lastErrorMessage = AtomicReference<String?>(null)
+    private val knownConnectedSerials = AtomicReference<Set<String>>(emptySet())
+    private val baselineEstablished = AtomicBoolean(false)
 
     init {
         Disposer.register(project, DisposableHandle())
@@ -27,12 +30,8 @@ class ProxyCommanderReconnectService(private val project: Project) {
             return
         }
 
-        val settings = ProxyCommanderSettingsService.getInstance(project)
-        if (settings.getRememberedDeviceIds().isEmpty()) {
-            lastErrorMessage.set(null)
-            return
-        }
-
+        // The watcher always runs while the project is open: it auto-reconnects remembered
+        // devices and offers to connect newly-appeared devices that are not yet remembered.
         ApplicationManager.getApplication().executeOnPooledThread {
             runTrackingLoop(token)
         }
@@ -41,12 +40,6 @@ class ProxyCommanderReconnectService(private val project: Project) {
     private fun runTrackingLoop(token: Int) {
         while (isCurrent(token)) {
             val settings = ProxyCommanderSettingsService.getInstance(project)
-            val remembered = settings.getRememberedDeviceIds()
-            if (remembered.isEmpty()) {
-                lastErrorMessage.set(null)
-                return
-            }
-
             val config = settings.getConfig()
             val controller = ProxyCommanderController(project, config)
             val logs = mutableListOf<String>()
@@ -63,16 +56,15 @@ class ProxyCommanderReconnectService(private val project: Project) {
                 log = logs::add,
                 shouldStop = {
                     !isCurrent(token) ||
-                        ProxyCommanderSettingsService.getInstance(project).getRememberedDeviceIds().isEmpty() ||
                         ProxyCommanderSettingsService.getInstance(project).getConfig() != config
                 },
-                onSnapshot = {
-                    reconcileRememberedDevices(token)
+                onSnapshot = { snapshot ->
+                    onDevicesSnapshot(token, snapshot)
                 }
             )
 
             if (!finished) {
-                notifyAutoReconnectError(summarize(logs, "Stopped watching remembered devices."))
+                notifyAutoReconnectError(summarize(logs, "Stopped watching connected devices."))
             }
 
             if (!sleepWhileCurrent(token, WATCH_RETRY_DELAY_MS)) {
@@ -81,14 +73,20 @@ class ProxyCommanderReconnectService(private val project: Project) {
         }
     }
 
-    private fun reconcileRememberedDevices(token: Int) {
+    private fun onDevicesSnapshot(token: Int, snapshotSerials: Set<String>) {
         if (!isCurrent(token)) {
             return
         }
 
+        val previouslyKnown = knownConnectedSerials.getAndSet(snapshotSerials)
+        val isBaseline = !baselineEstablished.getAndSet(true)
+        // Devices already connected when tracking first starts form the baseline and are not
+        // treated as "newly appeared", so the IDE does not flood the user with offers at startup.
+        val newSerials = if (isBaseline) emptySet() else snapshotSerials - previouslyKnown
+
         val settings = ProxyCommanderSettingsService.getInstance(project)
         val remembered = settings.getRememberedDeviceIds()
-        if (remembered.isEmpty()) {
+        if (remembered.isEmpty() && newSerials.isEmpty()) {
             return
         }
 
@@ -99,11 +97,60 @@ class ProxyCommanderReconnectService(private val project: Project) {
             return
         }
 
-        controller.listConnectedDeviceDetails(logs::add)
-            .filter { it.identifier in remembered && !it.isProxyConnected }
+        val details = controller.listConnectedDeviceDetails(logs::add)
+
+        details.filter { it.identifier in remembered && !it.isProxyConnected }
             .forEach { device ->
                 autoConnectRememberedDevice(device.serial, token)
             }
+
+        if (newSerials.isNotEmpty()) {
+            details.filter { it.serial in newSerials && it.identifier !in remembered && !it.isProxyConnected }
+                .forEach { device ->
+                    offerConnectToDevice(device)
+                }
+        }
+    }
+
+    private fun offerConnectToDevice(device: ConnectedDeviceDetails) {
+        val identifier = device.identifier
+        val serial = device.serial
+        val name = device.name.ifBlank { identifier }
+
+        ApplicationManager.getApplication().invokeLater {
+            val notification = Notification(
+                "ProxyCommander",
+                "ProxyCommander",
+                "New device available: $name. Connect it to the proxy?",
+                NotificationType.INFORMATION
+            )
+            notification.addAction(NotificationAction.createSimple("Connect to Proxy") {
+                notification.expire()
+                connectAndRememberDevice(serial, identifier, name)
+            })
+            Notifications.Bus.notify(notification, project)
+        }
+    }
+
+    private fun connectAndRememberDevice(serial: String, identifier: String, name: String) {
+        ApplicationManager.getApplication().executeOnPooledThread {
+            val settings = ProxyCommanderSettingsService.getInstance(project)
+            val logs = mutableListOf<String>()
+            val controller = ProxyCommanderController(project, settings.getConfig())
+            if (!controller.ensureAdbAvailable(logs::add)) {
+                notifyAutoReconnectError(summarize(logs, "ADB command is not available."))
+                return@executeOnPooledThread
+            }
+
+            if (controller.connectDevice(serial, logs::add)) {
+                settings.rememberDevices(listOf(RememberedDevice(identifier, name)))
+                clearAutoReconnectError()
+                refreshTracking()
+                notifyAutoReconnectSuccess("Connected proxy to $name and enabled auto-connect.")
+            } else {
+                notifyAutoReconnectError("Failed to connect proxy to $name: ${summarize(logs, "Unknown error.")}")
+            }
+        }
     }
 
     private fun autoConnectRememberedDevice(serial: String, token: Int) {
