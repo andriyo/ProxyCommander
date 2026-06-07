@@ -5,6 +5,11 @@ import com.intellij.openapi.startup.ProjectActivity
 
 class ProxyCommanderProjectActivity : ProjectActivity {
     override suspend fun execute(project: Project) {
-        ProxyCommanderReconnectService.getInstance(project).refreshTracking()
+        // Fold settings persisted by older project-level builds into the application-level service.
+        ProxyCommanderLegacyProjectSettings.getInstance(project).consume()?.let { legacy ->
+            ProxyCommanderSettingsService.getInstance().importLegacyState(legacy)
+        }
+        // Idempotent: a single watcher serves every open project (see refreshTracking).
+        ProxyCommanderReconnectService.getInstance().refreshTracking()
     }
 }

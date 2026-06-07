@@ -1,37 +1,67 @@
 package io.github.andriyo.proxycommander
 
-import com.intellij.notification.Notification
 import com.intellij.notification.NotificationAction
 import com.intellij.notification.NotificationType
 import com.intellij.notification.Notifications
+import com.intellij.openapi.Disposable
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.components.Service
-import com.intellij.openapi.project.Project
-import com.intellij.openapi.util.Disposer
+import com.intellij.openapi.project.ProjectManager
+import com.intellij.util.concurrency.AppExecutorUtil
+import java.util.Collections
+import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 
-@Service(Service.Level.PROJECT)
-class ProxyCommanderReconnectService(private val project: Project) {
+@Service(Service.Level.APP)
+class ProxyCommanderReconnectService : Disposable {
     private val disposed = AtomicBoolean(false)
     private val generation = AtomicInteger(0)
     private val lastErrorMessage = AtomicReference<String?>(null)
     private val knownConnectedSerials = AtomicReference<Set<String>>(emptySet())
     private val baselineEstablished = AtomicBoolean(false)
 
-    init {
-        Disposer.register(project, DisposableHandle())
+    private val latestSnapshot = AtomicReference<Set<String>>(emptySet())
+    private val pendingSnapshot = AtomicReference<Set<String>?>(null)
+    private val listeners = CopyOnWriteArrayList<DevicesListener>()
+    private val autoConnectInFlight = Collections.synchronizedSet(HashSet<String>())
+
+    // The track-devices read loop must never block, so all adb-heavy work runs off it:
+    // snapshots are processed one-at-a-time (newest wins) and auto-connect — which can wait up to
+    // a minute for a booting device — is serialized on its own executor.
+    private val snapshotExecutor = AppExecutorUtil.createBoundedApplicationPoolExecutor(
+        "ProxyCommander-Snapshot", 1
+    )
+    private val connectExecutor = AppExecutorUtil.createBoundedApplicationPoolExecutor(
+        "ProxyCommander-AutoConnect", 1
+    )
+
+    /** Notified (on a background thread) whenever the set of connected device serials changes. */
+    fun interface DevicesListener {
+        fun onConnectedDevicesChanged(connectedSerials: Set<String>)
     }
+
+    fun addListener(listener: DevicesListener) {
+        listeners.add(listener)
+        listener.onConnectedDevicesChanged(latestSnapshot.get())
+    }
+
+    fun removeListener(listener: DevicesListener) {
+        listeners.remove(listener)
+    }
+
+    fun connectedSerials(): Set<String> = latestSnapshot.get()
 
     fun refreshTracking() {
         val token = generation.incrementAndGet()
-        if (disposed.get() || project.isDisposed) {
+        if (disposed.get()) {
             return
         }
 
-        // The watcher always runs while the project is open: it auto-reconnects remembered
-        // devices and offers to connect newly-appeared devices that are not yet remembered.
+        // A single application-wide watcher auto-reconnects remembered devices and offers to connect
+        // newly-appeared devices. Calling this again simply supersedes the previous loop via the
+        // generation token, so opening multiple projects never spins up competing watchers.
         ApplicationManager.getApplication().executeOnPooledThread {
             runTrackingLoop(token)
         }
@@ -39,9 +69,9 @@ class ProxyCommanderReconnectService(private val project: Project) {
 
     private fun runTrackingLoop(token: Int) {
         while (isCurrent(token)) {
-            val settings = ProxyCommanderSettingsService.getInstance(project)
+            val settings = ProxyCommanderSettingsService.getInstance()
             val config = settings.getConfig()
-            val controller = ProxyCommanderController(project, config)
+            val controller = ProxyCommanderController(currentBasePath(), config)
             val logs = mutableListOf<String>()
             if (!controller.ensureAdbAvailable(logs::add)) {
                 notifyAutoReconnectError(summarize(logs, "ADB command is not available."))
@@ -56,10 +86,10 @@ class ProxyCommanderReconnectService(private val project: Project) {
                 log = logs::add,
                 shouldStop = {
                     !isCurrent(token) ||
-                        ProxyCommanderSettingsService.getInstance(project).getConfig() != config
+                        ProxyCommanderSettingsService.getInstance().getConfig() != config
                 },
                 onSnapshot = { snapshot ->
-                    onDevicesSnapshot(token, snapshot)
+                    onSnapshotFast(token, snapshot)
                 }
             )
 
@@ -73,7 +103,28 @@ class ProxyCommanderReconnectService(private val project: Project) {
         }
     }
 
-    private fun onDevicesSnapshot(token: Int, snapshotSerials: Set<String>) {
+    private fun onSnapshotFast(token: Int, snapshot: Set<String>) {
+        if (!isCurrent(token)) {
+            return
+        }
+        latestSnapshot.set(snapshot)
+        fireDevicesChanged(snapshot)
+
+        pendingSnapshot.set(snapshot)
+        if (snapshotExecutor.isShutdown) {
+            return
+        }
+        runCatching {
+            snapshotExecutor.execute {
+                val pending = pendingSnapshot.getAndSet(null) ?: return@execute
+                if (isCurrent(token)) {
+                    processSnapshot(token, pending)
+                }
+            }
+        }
+    }
+
+    private fun processSnapshot(token: Int, snapshotSerials: Set<String>) {
         if (!isCurrent(token)) {
             return
         }
@@ -84,14 +135,14 @@ class ProxyCommanderReconnectService(private val project: Project) {
         // treated as "newly appeared", so the IDE does not flood the user with offers at startup.
         val newSerials = if (isBaseline) emptySet() else snapshotSerials - previouslyKnown
 
-        val settings = ProxyCommanderSettingsService.getInstance(project)
+        val settings = ProxyCommanderSettingsService.getInstance()
         val remembered = settings.getRememberedDeviceIds()
         if (remembered.isEmpty() && newSerials.isEmpty()) {
             return
         }
 
         val logs = mutableListOf<String>()
-        val controller = ProxyCommanderController(project, settings.getConfig())
+        val controller = ProxyCommanderController(currentBasePath(), settings.getConfig())
         if (!controller.ensureAdbAvailable(logs::add)) {
             notifyAutoReconnectError(summarize(logs, "ADB command is not available."))
             return
@@ -101,7 +152,7 @@ class ProxyCommanderReconnectService(private val project: Project) {
 
         details.filter { it.identifier in remembered && !it.isProxyConnected }
             .forEach { device ->
-                autoConnectRememberedDevice(device.serial, token)
+                scheduleAutoConnect(device.serial, token)
             }
 
         if (newSerials.isNotEmpty()) {
@@ -112,15 +163,30 @@ class ProxyCommanderReconnectService(private val project: Project) {
         }
     }
 
+    private fun scheduleAutoConnect(serial: String, token: Int) {
+        if (connectExecutor.isShutdown || !autoConnectInFlight.add(serial)) {
+            return
+        }
+        runCatching {
+            connectExecutor.execute {
+                try {
+                    if (isCurrent(token)) {
+                        autoConnectRememberedDevice(serial, token)
+                    }
+                } finally {
+                    autoConnectInFlight.remove(serial)
+                }
+            }
+        }.onFailure { autoConnectInFlight.remove(serial) }
+    }
+
     private fun offerConnectToDevice(device: ConnectedDeviceDetails) {
         val identifier = device.identifier
         val serial = device.serial
         val name = device.name.ifBlank { identifier }
 
         ApplicationManager.getApplication().invokeLater {
-            val notification = Notification(
-                "ProxyCommander",
-                "ProxyCommander",
+            val notification = ProxyCommanderNotifications.create(
                 "New device available: $name. Connect it to the proxy?",
                 NotificationType.INFORMATION
             )
@@ -128,15 +194,15 @@ class ProxyCommanderReconnectService(private val project: Project) {
                 notification.expire()
                 connectAndRememberDevice(serial, identifier, name)
             })
-            Notifications.Bus.notify(notification, project)
+            Notifications.Bus.notify(notification)
         }
     }
 
     private fun connectAndRememberDevice(serial: String, identifier: String, name: String) {
         ApplicationManager.getApplication().executeOnPooledThread {
-            val settings = ProxyCommanderSettingsService.getInstance(project)
+            val settings = ProxyCommanderSettingsService.getInstance()
             val logs = mutableListOf<String>()
-            val controller = ProxyCommanderController(project, settings.getConfig())
+            val controller = ProxyCommanderController(currentBasePath(), settings.getConfig())
             if (!controller.ensureAdbAvailable(logs::add)) {
                 notifyAutoReconnectError(summarize(logs, "ADB command is not available."))
                 return@executeOnPooledThread
@@ -145,6 +211,7 @@ class ProxyCommanderReconnectService(private val project: Project) {
             if (controller.connectDevice(serial, logs::add)) {
                 settings.rememberDevices(listOf(RememberedDevice(identifier, name)))
                 clearAutoReconnectError()
+                fireDevicesChanged(latestSnapshot.get())
                 refreshTracking()
                 notifyAutoReconnectSuccess("Connected proxy to $name and enabled auto-connect.")
             } else {
@@ -160,8 +227,8 @@ class ProxyCommanderReconnectService(private val project: Project) {
             }
 
             val logs = mutableListOf<String>()
-            val settings = ProxyCommanderSettingsService.getInstance(project)
-            val controller = ProxyCommanderController(project, settings.getConfig())
+            val settings = ProxyCommanderSettingsService.getInstance()
+            val controller = ProxyCommanderController(currentBasePath(), settings.getConfig())
             if (!controller.ensureAdbAvailable(logs::add)) {
                 notifyAutoReconnectError(summarize(logs, "ADB command is not available."))
                 return
@@ -180,6 +247,7 @@ class ProxyCommanderReconnectService(private val project: Project) {
 
             if (controller.connectDevice(serial, logs::add)) {
                 clearAutoReconnectError()
+                fireDevicesChanged(latestSnapshot.get())
                 val testPassed = controller.testProxyConnection(serial, logs::add)
                 if (testPassed) {
                     notifyAutoReconnectSuccess("Auto-connected proxy to $identifier and verified host proxy connection.")
@@ -197,6 +265,15 @@ class ProxyCommanderReconnectService(private val project: Project) {
         }
     }
 
+    private fun fireDevicesChanged(connectedSerials: Set<String>) {
+        listeners.forEach { listener ->
+            runCatching { listener.onConnectedDevicesChanged(connectedSerials) }
+        }
+    }
+
+    private fun currentBasePath(): String? =
+        ProjectManager.getInstance().openProjects.firstOrNull { !it.isDisposed }?.basePath
+
     private fun summarize(logs: List<String>, fallback: String): String {
         val lastLog = logs.lastOrNull { it.isNotBlank() }?.removePrefix("[ProxyCommander] ")?.trim()
         return lastLog.takeUnless { it.isNullOrBlank() } ?: fallback
@@ -210,13 +287,7 @@ class ProxyCommanderReconnectService(private val project: Project) {
         if (previous == message) {
             return
         }
-
-        ApplicationManager.getApplication().invokeLater {
-            Notifications.Bus.notify(
-                Notification("ProxyCommander", "ProxyCommander", message, NotificationType.ERROR),
-                project
-            )
-        }
+        ProxyCommanderNotifications.notify(message, NotificationType.ERROR)
     }
 
     private fun clearAutoReconnectError() {
@@ -224,16 +295,7 @@ class ProxyCommanderReconnectService(private val project: Project) {
     }
 
     private fun notifyAutoReconnectSuccess(message: String) {
-        if (message.isBlank()) {
-            return
-        }
-
-        ApplicationManager.getApplication().invokeLater {
-            Notifications.Bus.notify(
-                Notification("ProxyCommander", "ProxyCommander", message, NotificationType.INFORMATION),
-                project
-            )
-        }
+        ProxyCommanderNotifications.notify(message, NotificationType.INFORMATION)
     }
 
     private fun sleepWhileCurrent(token: Int, delayMs: Long): Boolean {
@@ -250,13 +312,14 @@ class ProxyCommanderReconnectService(private val project: Project) {
     }
 
     private fun isCurrent(token: Int): Boolean =
-        !disposed.get() && !project.isDisposed && generation.get() == token
+        !disposed.get() && generation.get() == token
 
-    private inner class DisposableHandle : com.intellij.openapi.Disposable {
-        override fun dispose() {
-            disposed.set(true)
-            generation.incrementAndGet()
-        }
+    override fun dispose() {
+        disposed.set(true)
+        generation.incrementAndGet()
+        snapshotExecutor.shutdownNow()
+        connectExecutor.shutdownNow()
+        listeners.clear()
     }
 
     companion object {
@@ -266,7 +329,7 @@ class ProxyCommanderReconnectService(private val project: Project) {
         private const val DEVICE_READY_TIMEOUT_MS = 60_000L
         private const val WATCH_RETRY_DELAY_MS = 1_000L
 
-        fun getInstance(project: Project): ProxyCommanderReconnectService =
-            project.getService(ProxyCommanderReconnectService::class.java)
+        fun getInstance(): ProxyCommanderReconnectService =
+            ApplicationManager.getApplication().getService(ProxyCommanderReconnectService::class.java)
     }
 }

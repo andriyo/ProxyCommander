@@ -1,41 +1,30 @@
 package io.github.andriyo.proxycommander
 
 import com.intellij.icons.AllIcons
-import com.intellij.notification.Notification
 import com.intellij.notification.NotificationType
-import com.intellij.notification.Notifications
 import com.intellij.openapi.actionSystem.AnActionEvent
 import com.intellij.openapi.actionSystem.DataKey
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.application.ModalityState
-import com.intellij.openapi.fileChooser.FileChooserDescriptorFactory
+import com.intellij.openapi.options.ShowSettingsUtil
 import com.intellij.openapi.project.DumbAwareAction
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.ui.DialogWrapper
 import com.intellij.openapi.ui.Messages
-import com.intellij.openapi.ui.TextBrowseFolderListener
-import com.intellij.openapi.ui.TextFieldWithBrowseButton
-import com.intellij.openapi.ui.ValidationInfo
 import com.intellij.openapi.util.IconLoader
 import com.intellij.ui.components.JBLabel
 import com.intellij.ui.components.JBScrollPane
-import com.intellij.ui.components.JBTextField
-import com.intellij.util.ui.FormBuilder
 import com.intellij.util.ui.JBUI
 import java.awt.BorderLayout
 import java.awt.Component
 import java.awt.Container
 import java.awt.Dimension
 import java.awt.FlowLayout
-import java.awt.event.ActionEvent
-import java.io.File
-import javax.swing.AbstractAction
 import javax.swing.AbstractButton
 import javax.swing.Action
 import javax.swing.Box
 import javax.swing.BoxLayout
 import javax.swing.JButton
-import javax.swing.JCheckBox
 import javax.swing.JComponent
 import javax.swing.JPanel
 
@@ -100,31 +89,6 @@ class ProxyCommanderSettingsAction : DumbAwareAction(
     }
 }
 
-class StreamingToolbarContextTestAction : DumbAwareAction(
-    "Show Current Device Context (Test)",
-    "Show the serial/device resolved from Running Devices toolbar context",
-    AllIcons.Actions.Help
-) {
-    override fun update(event: AnActionEvent) {
-        event.presentation.isVisible = true
-        event.presentation.isEnabled = ProxyCommanderStreamingContextResolver.extract(event) != null
-    }
-
-    override fun actionPerformed(event: AnActionEvent) {
-        val project = event.project ?: return
-        val target = ProxyCommanderStreamingContextResolver.extract(event)
-        val message = if (target != null) {
-            "Resolved from ${target.source}: serial=${target.serial}, kind=${target.kind}"
-        } else {
-            "No device context found in place='${event.place}'."
-        }
-        Notifications.Bus.notify(
-            Notification("ProxyCommander", "ProxyCommander Test", message, NotificationType.INFORMATION),
-            project
-        )
-    }
-}
-
 private data class StreamingTarget(
     val serial: String,
     val source: String,
@@ -170,7 +134,7 @@ private object ProxyCommanderStreamingContextResolver {
 
 private object ProxyCommanderActionRunner {
     fun runConnectAll(project: Project) {
-        val settings = ProxyCommanderSettingsService.getInstance(project)
+        val settings = ProxyCommanderSettingsService.getInstance()
         runBulkWithEmulatorSummary(
             project = project,
             actionName = "Connect proxy to all devices"
@@ -178,14 +142,14 @@ private object ProxyCommanderActionRunner {
             val success = controller.connectAllDevices(log)
             if (success) {
                 settings.rememberDevices(controller.listConnectedDeviceDetails(log).map { RememberedDevice(it.identifier, it.name) })
-                ProxyCommanderReconnectService.getInstance(project).refreshTracking()
+                ProxyCommanderReconnectService.getInstance().refreshTracking()
             }
             success
         }
     }
 
     fun runDisconnectAll(project: Project) {
-        val settings = ProxyCommanderSettingsService.getInstance(project)
+        val settings = ProxyCommanderSettingsService.getInstance()
         runBulkWithEmulatorSummary(
             project = project,
             actionName = "Disconnect proxy from all devices"
@@ -193,21 +157,18 @@ private object ProxyCommanderActionRunner {
             val success = controller.disconnectAllDevices(log)
             if (success) {
                 settings.clearRememberedDevices()
-                ProxyCommanderReconnectService.getInstance(project).refreshTracking()
+                ProxyCommanderReconnectService.getInstance().refreshTracking()
             }
             success
         }
     }
 
     fun runDevices(project: Project) {
-        val settings = ProxyCommanderSettingsService.getInstance(project)
-        ApplicationManager.getApplication().invokeLater {
-            DevicesDialog(project, settings).show()
-        }
+        ProxyCommanderUi.openDevicesDialog(project)
     }
 
     fun runConnectActiveEmulatorAndClearOthersProxy(project: Project, target: StreamingTarget?) {
-        val settings = ProxyCommanderSettingsService.getInstance(project)
+        val settings = ProxyCommanderSettingsService.getInstance()
         runInBackground(
             project = project,
             actionName = "Connect proxy to current emulator and disconnect proxy from other devices"
@@ -221,34 +182,15 @@ private object ProxyCommanderActionRunner {
                     ?.let { RememberedDevice(it.identifier, it.name) }
                     ?: RememberedDevice(activeSerial, activeSerial)
                 settings.replaceRememberedDevices(listOf(remembered))
-                ProxyCommanderReconnectService.getInstance(project).refreshTracking()
+                ProxyCommanderReconnectService.getInstance().refreshTracking()
             }
             success
         }
     }
 
     fun runSettings(project: Project) {
-        val settings = ProxyCommanderSettingsService.getInstance(project)
-        val currentConfig = settings.getConfig()
         ApplicationManager.getApplication().invokeLater {
-            val dialog = ProxyCommanderSettingsDialog(project, currentConfig)
-            if (!dialog.showAndGet()) {
-                return@invokeLater
-            }
-
-            settings.updateConfig(
-                port = dialog.selectedPort(),
-                adbPath = dialog.selectedAdbPath(),
-                resetTimeOnConnect = dialog.isResetTimeOnConnect()
-            )
-            ProxyCommanderReconnectService.getInstance(project).refreshTracking()
-            val adbSummary = dialog.selectedAdbPath().ifBlank { "<PATH or \$ADB>" }
-            val resetSummary = if (dialog.isResetTimeOnConnect()) "on" else "off"
-            notify(
-                project = project,
-                message = "Settings saved (port=${dialog.selectedPort()}, adb=$adbSummary, reset-time=$resetSummary).",
-                type = NotificationType.INFORMATION
-            )
+            ShowSettingsUtil.getInstance().showSettingsDialog(project, ProxyCommanderConfigurable::class.java)
         }
     }
 
@@ -257,7 +199,7 @@ private object ProxyCommanderActionRunner {
         actionName: String,
         operation: (ProxyCommanderController, (String) -> Unit) -> Boolean
     ) {
-        val config = ProxyCommanderSettingsService.getInstance(project).getConfig()
+        val config = ProxyCommanderSettingsService.getInstance().getConfig()
         ApplicationManager.getApplication().executeOnPooledThread {
             val logs = mutableListOf<String>()
             val controller = ProxyCommanderController(project, config)
@@ -277,10 +219,10 @@ private object ProxyCommanderActionRunner {
             } else {
                 "$actionName failed."
             }
-            notify(
-                project = project,
+            ProxyCommanderNotifications.notify(
                 message = summarize(logs, fallback),
-                type = if (success) NotificationType.INFORMATION else NotificationType.ERROR
+                type = if (success) NotificationType.INFORMATION else NotificationType.ERROR,
+                project = project
             )
         }
     }
@@ -290,7 +232,7 @@ private object ProxyCommanderActionRunner {
         actionName: String,
         operation: (ProxyCommanderController, (String) -> Unit) -> Boolean
     ) {
-        val config = ProxyCommanderSettingsService.getInstance(project).getConfig()
+        val config = ProxyCommanderSettingsService.getInstance().getConfig()
         ApplicationManager.getApplication().executeOnPooledThread {
             val logs = mutableListOf<String>()
             val controller = ProxyCommanderController(project, config)
@@ -323,10 +265,10 @@ private object ProxyCommanderActionRunner {
             } else {
                 summarize(logs, actionSummary)
             }
-            notify(
-                project = project,
+            ProxyCommanderNotifications.notify(
                 message = message,
-                type = if (success) NotificationType.INFORMATION else NotificationType.ERROR
+                type = if (success) NotificationType.INFORMATION else NotificationType.ERROR,
+                project = project
             )
         }
     }
@@ -353,7 +295,7 @@ private object ProxyCommanderActionRunner {
     ): String? {
         val targetSerial = target?.serial?.trim().orEmpty()
         if (targetSerial.isNotEmpty()) {
-            if (EMULATOR_SERIAL_REGEX.matches(targetSerial)) {
+            if (ProxyCommanderParsing.isEmulatorSerial(targetSerial)) {
                 val source = target?.source ?: "unknown source"
                 log("[ProxyCommander] Active emulator from $source: $targetSerial")
                 return targetSerial
@@ -385,91 +327,14 @@ private object ProxyCommanderActionRunner {
         val lastLog = logs.lastOrNull { it.isNotBlank() }?.removePrefix("[ProxyCommander] ")?.trim()
         return lastLog.takeUnless { it.isNullOrBlank() } ?: fallback
     }
-
-    private fun notify(project: Project, message: String, type: NotificationType) {
-        ApplicationManager.getApplication().invokeLater {
-            Notifications.Bus.notify(
-                Notification("ProxyCommander", "ProxyCommander", message, type),
-                project
-            )
-        }
-    }
-
-    private val EMULATOR_SERIAL_REGEX = Regex("^emulator-[0-9]+$")
 }
 
-private class ProxyCommanderSettingsDialog(
-    project: Project,
-    currentConfig: ProxyCommanderConfig
-) : DialogWrapper(project) {
-
-    private val portField = JBTextField(currentConfig.port.toString())
-    private val adbPathField = TextFieldWithBrowseButton()
-    private val resetTimeCheckbox = JCheckBox(
-        "Reset device clock on connect (forces NTP resync)",
-        currentConfig.resetTimeOnConnect
-    )
-    private val resetDefaultsAction = object : AbstractAction("Reset to Defaults") {
-        override fun actionPerformed(event: ActionEvent) {
-            portField.text = ProxyCommanderSettingsService.DEFAULT_PORT.toString()
-            adbPathField.text = ""
-            resetTimeCheckbox.isSelected = true
+internal object ProxyCommanderUi {
+    fun openDevicesDialog(project: Project) {
+        ApplicationManager.getApplication().invokeLater {
+            DevicesDialog(project, ProxyCommanderSettingsService.getInstance()).show()
         }
     }
-
-    init {
-        title = "Proxy Commander Settings"
-        adbPathField.text = currentConfig.adbPath
-        adbPathField.addBrowseFolderListener(
-            TextBrowseFolderListener(
-                FileChooserDescriptorFactory.createSingleFileNoJarsDescriptor()
-                    .withTitle("Select adb Executable")
-                    .withDescription("Choose adb executable from Android SDK platform-tools (optional)"),
-                project
-            )
-        )
-        init()
-    }
-
-    override fun createCenterPanel(): JComponent {
-        val panel = FormBuilder.createFormBuilder()
-            .addLabeledComponent(JBLabel("Port:"), portField)
-            .addLabeledComponent(JBLabel("ADB Path (optional):"), adbPathField)
-            .addComponent(JBLabel("Leave ADB Path empty to use \$ADB, autodetect from the Android SDK, or fall back to adb from PATH."))
-            .addComponent(resetTimeCheckbox)
-            .panel
-        panel.preferredSize = Dimension(620, panel.preferredSize.height)
-        panel.border = JBUI.Borders.empty(8)
-        return panel
-    }
-
-    override fun createLeftSideActions(): Array<Action> = arrayOf(resetDefaultsAction)
-
-    override fun doValidate(): ValidationInfo? {
-        val port = portField.text.trim().toIntOrNull()
-            ?: return ValidationInfo("Port must be a number.", portField)
-        if (port !in 1..65535) {
-            return ValidationInfo("Port must be between 1 and 65535.", portField)
-        }
-
-        val adbPath = adbPathField.text.trim()
-        if (adbPath.isNotEmpty()) {
-            val adbFile = File(adbPath)
-            if (!adbFile.exists()) {
-                return ValidationInfo("ADB path does not exist.", adbPathField)
-            }
-            if (!adbFile.isFile) {
-                return ValidationInfo("ADB path must point to the adb executable file.", adbPathField)
-            }
-        }
-        return null
-    }
-
-    fun selectedPort(): Int = portField.text.trim().toInt()
-
-    fun selectedAdbPath(): String = adbPathField.text.trim()
-
-    fun isResetTimeOnConnect(): Boolean = resetTimeCheckbox.isSelected
 }
 
 private data class DeviceDialogEntry(
@@ -493,6 +358,25 @@ private class DevicesDialog(
     private val connectAllButton = JButton("Proxy All", CONNECT_ALL_ICON)
     private val disconnectAllButton = JButton("Unproxy All", DISCONNECT_ALL_ICON)
 
+    @Volatile
+    private var busy = false
+    private var lastSignaledSerials: Set<String>? = null
+
+    // Live-update: when the background watcher reports a change in connected devices, refresh the
+    // list instead of forcing the user to click Refresh. Skipped while an operation is mid-flight.
+    private val devicesListener = ProxyCommanderReconnectService.DevicesListener { serials ->
+        ApplicationManager.getApplication().invokeLater(
+            {
+                if (isDisposed || busy || serials == lastSignaledSerials) {
+                    return@invokeLater
+                }
+                lastSignaledSerials = serials
+                reloadDevices()
+            },
+            ModalityState.any()
+        )
+    }
+
     init {
         title = "Devices"
         cancelAction.putValue(Action.NAME, "Close")
@@ -500,7 +384,13 @@ private class DevicesDialog(
         refreshButton.addActionListener { reloadDevices() }
         connectAllButton.addActionListener { connectAllDevices() }
         disconnectAllButton.addActionListener { disconnectAllDevices() }
+        ProxyCommanderReconnectService.getInstance().addListener(devicesListener)
         reloadDevices()
+    }
+
+    override fun dispose() {
+        ProxyCommanderReconnectService.getInstance().removeListener(devicesListener)
+        super.dispose()
     }
 
     override fun createCenterPanel(): JComponent {
@@ -631,7 +521,7 @@ private class DevicesDialog(
                 settings.rememberDevices(
                     controller.listConnectedDeviceDetails(log).map { RememberedDevice(it.identifier, it.name) }
                 )
-                ProxyCommanderReconnectService.getInstance(project).refreshTracking()
+                ProxyCommanderReconnectService.getInstance().refreshTracking()
             }
             success
         }
@@ -646,7 +536,7 @@ private class DevicesDialog(
             val success = controller.disconnectAllDevices(log)
             if (success) {
                 settings.clearRememberedDevices()
-                ProxyCommanderReconnectService.getInstance(project).refreshTracking()
+                ProxyCommanderReconnectService.getInstance().refreshTracking()
             }
             success
         }
@@ -662,7 +552,7 @@ private class DevicesDialog(
             val success = controller.connectDevice(serial, log)
             if (success) {
                 settings.rememberDevices(listOf(RememberedDevice(entry.id, entry.name)))
-                ProxyCommanderReconnectService.getInstance(project).refreshTracking()
+                ProxyCommanderReconnectService.getInstance().refreshTracking()
             }
             success
         }
@@ -678,7 +568,7 @@ private class DevicesDialog(
             val success = controller.keepOnlyDevice(serial, log)
             if (success) {
                 settings.replaceRememberedDevices(listOf(RememberedDevice(entry.id, entry.name)))
-                ProxyCommanderReconnectService.getInstance(project).refreshTracking()
+                ProxyCommanderReconnectService.getInstance().refreshTracking()
             }
             success
         }
@@ -706,6 +596,7 @@ private class DevicesDialog(
         showNotificationOnCompletion: Boolean = true,
         operation: (ProxyCommanderController, (String) -> Unit) -> Boolean
     ) {
+        busy = true
         setOperationInProgress(busyMessage)
         ApplicationManager.getApplication().executeOnPooledThread {
             val logs = mutableListOf<String>()
@@ -723,15 +614,12 @@ private class DevicesDialog(
             val message = summarizeLogs(logs, if (success) fallbackSuccess else fallbackFailure)
             ApplicationManager.getApplication().invokeLater(
                 {
+                    busy = false
                     if (showNotificationOnCompletion) {
-                        Notifications.Bus.notify(
-                            Notification(
-                                "ProxyCommander",
-                                "ProxyCommander",
-                                message,
-                                if (success) NotificationType.INFORMATION else NotificationType.ERROR
-                            ),
-                            project
+                        ProxyCommanderNotifications.notify(
+                            message = message,
+                            type = if (success) NotificationType.INFORMATION else NotificationType.ERROR,
+                            project = project
                         )
                     }
                     if (showDialogOnCompletion) {

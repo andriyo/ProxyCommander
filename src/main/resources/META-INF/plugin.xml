@@ -45,6 +45,13 @@
 
     <extensions defaultExtensionNs="com.intellij">
         <postStartupActivity implementation="io.github.andriyo.proxycommander.ProxyCommanderProjectActivity"/>
+        <notificationGroup id="ProxyCommander" displayType="BALLOON"/>
+        <applicationConfigurable parentId="tools"
+                                 id="io.github.andriyo.proxycommander.settings"
+                                 displayName="Proxy Commander"
+                                 instance="io.github.andriyo.proxycommander.ProxyCommanderConfigurable"/>
+        <statusBarWidgetFactory id="ProxyCommanderStatusBarWidget"
+                                implementation="io.github.andriyo.proxycommander.ProxyCommanderStatusBarWidgetFactory"/>
     </extensions>
 
     <actions>
@@ -76,11 +83,6 @@
                     text="Settings..."
                     description="Configure Proxy Commander port and adb path"
                     icon="/icons/proxy_settings.svg"/>
-            <action id="ProxyCommander.StreamingContextTestAction"
-                    class="io.github.andriyo.proxycommander.StreamingToolbarContextTestAction"
-                    text="Show Current Device Context (Test)"
-                    description="Show serial and kind for the device from Running Devices context"
-                    icon="/icons/proxy_context.svg"/>
         </group>
         <action id="ProxyCommander.StreamingConnectAllAction"
                 class="io.github.andriyo.proxycommander.ConnectAllDevicesAction"

@@ -68,32 +68,17 @@ internal class ProxyCommanderController private constructor(
             return emptyList()
         }
 
-        return result.output
-            .lineSequence()
-            .map { it.trim() }
-            .filter { it.isNotEmpty() && !it.startsWith("List of devices") }
-            .mapNotNull { line ->
-                val columns = line.split(Regex("\\s+"))
-                if (columns.size < 2 || columns[1] != "device") {
-                    null
-                } else {
-                    val serial = columns[0]
-                    ConnectedDevice(
-                        serial = serial,
-                        isEmulator = EMULATOR_SERIAL_REGEX.matches(serial)
-                    )
-                }
-            }
-            .toList()
+        return ProxyCommanderParsing.parseDevices(result.output)
     }
 
     fun listConnectedEmulators(log: (String) -> Unit = {}): List<ConnectedEmulator> {
         val emulators = listConnectedDevices(log).filter { it.isEmulator }
         return emulators.map { device ->
+            val props = readDeviceProps(device.serial)
             ConnectedEmulator(
                 serial = device.serial,
-                avdName = readEmulatorAvdName(device.serial),
-                model = readDeviceModel(device.serial)
+                avdName = readStableEmulatorName(device.serial, props) ?: "Unknown AVD",
+                model = readModel(props)
             )
         }
     }
@@ -101,12 +86,14 @@ internal class ProxyCommanderController private constructor(
     fun listConnectedDeviceDetails(log: (String) -> Unit = {}): List<ConnectedDeviceDetails> {
         val devices = listConnectedDevices(log)
         return devices.map { device ->
-            val identifier = readDeviceIdentifier(device)
+            // One `getprop` dump per device instead of a separate adb call for each property.
+            val props = readDeviceProps(device.serial)
+            val identifier = readDeviceIdentifier(device, props)
             ConnectedDeviceDetails(
                 identifier = identifier,
                 serial = device.serial,
-                name = readDeviceDisplayName(device, identifier),
-                apiLevel = readDeviceApiLevel(device.serial),
+                name = readDeviceDisplayName(device, identifier, props),
+                apiLevel = readApiLevel(props),
                 isEmulator = device.isEmulator,
                 isProxyConnected = isProxyConnected(device.serial)
             )
@@ -369,17 +356,7 @@ internal class ProxyCommanderController private constructor(
         log("[ProxyCommander] Forced clock on $serial to host time via time_detector (epoch=${hostEpochMs}ms); state=${state.ifBlank { "<unavailable>" }}")
     }
 
-    private fun parseUptimeMillis(output: String): Long? {
-        val seconds = output
-            .lineSequence()
-            .map { it.trim() }
-            .firstOrNull { it.isNotEmpty() }
-            ?.split(Regex("\\s+"))
-            ?.firstOrNull()
-            ?.toDoubleOrNull()
-            ?: return null
-        return (seconds * 1000).toLong()
-    }
+    private fun parseUptimeMillis(output: String): Long? = ProxyCommanderParsing.parseUptimeMillis(output)
 
     private fun disconnectSerial(serial: String, log: (String) -> Unit): Boolean {
         val reverseRemoved = removeReverse(serial, log)
@@ -488,22 +465,27 @@ internal class ProxyCommanderController private constructor(
         return reverseListResult.success && containsReverseMapping(reverseListResult.output)
     }
 
-    private fun readEmulatorAvdName(serial: String): String {
-        return readStableEmulatorName(serial) ?: "Unknown AVD"
+    private fun readDeviceProps(serial: String): DeviceProps {
+        val result = adbClient.run(
+            serial,
+            listOf("shell", "getprop"),
+            allowFailure = true,
+            timeoutMs = 3_000
+        )
+        if (!result.success) {
+            return DeviceProps(emptyMap())
+        }
+        return DeviceProps(ProxyCommanderParsing.parseGetpropOutput(result.output))
     }
 
-    private fun readStableEmulatorName(serial: String): String? {
-        val propResult = adbClient.run(
-            serial,
-            listOf("shell", "getprop", "ro.boot.qemu.avd_name"),
-            allowFailure = true,
-            timeoutMs = 2_000
-        )
-        val propValue = propResult.output
-            .lineSequence()
-            .map { it.trim() }
-            .firstOrNull { it.isNotEmpty() && it != "null" }
-            .orEmpty()
+    private fun readModel(props: DeviceProps): String =
+        props.get("ro.product.model").ifBlank { "Unknown Model" }
+
+    private fun readApiLevel(props: DeviceProps): String =
+        props.get("ro.build.version.sdk").ifBlank { "?" }
+
+    private fun readStableEmulatorName(serial: String, props: DeviceProps): String? {
+        val propValue = props.get("ro.boot.qemu.avd_name")
         if (propValue.isNotBlank()) {
             return propValue
         }
@@ -522,59 +504,20 @@ internal class ProxyCommanderController private constructor(
         return emuValue.ifBlank { null }
     }
 
-    private fun readDeviceModel(serial: String): String {
-        val result = adbClient.run(
-            serial,
-            listOf("shell", "getprop", "ro.product.model"),
-            allowFailure = true,
-            timeoutMs = 2_000
-        )
-        val value = result.output
-            .lineSequence()
-            .map { it.trim() }
-            .firstOrNull { it.isNotEmpty() }
-            .orEmpty()
-        return value.ifBlank { "Unknown Model" }
-    }
+    private fun containsReverseMapping(output: String): Boolean =
+        ProxyCommanderParsing.containsReverseMapping(output, reverseToken)
 
-    private fun readDeviceApiLevel(serial: String): String {
-        val result = adbClient.run(
-            serial,
-            listOf("shell", "getprop", "ro.build.version.sdk"),
-            allowFailure = true,
-            timeoutMs = 2_000
-        )
-        val value = result.output
-            .lineSequence()
-            .map { it.trim() }
-            .firstOrNull { it.isNotEmpty() }
-            .orEmpty()
-        return value.ifBlank { "?" }
-    }
-
-    private fun containsReverseMapping(output: String): Boolean {
-        val lines = output.lineSequence().map { it.trim() }.filter { it.isNotEmpty() }
-        return lines.any { line ->
-            val columns = line.split(Regex("\\s+"))
-            when (columns.size) {
-                2 -> columns[0] == reverseToken && columns[1] == reverseToken
-                3 -> columns[1] == reverseToken && columns[2] == reverseToken
-                else -> false
-            }
-        }
-    }
-
-    private fun readDeviceIdentifier(device: ConnectedDevice): String {
+    private fun readDeviceIdentifier(device: ConnectedDevice, props: DeviceProps): String {
         if (!device.isEmulator) {
             return device.serial
         }
 
-        return readStableEmulatorName(device.serial) ?: device.serial
+        return readStableEmulatorName(device.serial, props) ?: device.serial
     }
 
-    private fun readDeviceDisplayName(device: ConnectedDevice, identifier: String): String {
-        val model = readDeviceModel(device.serial).takeUnless { it == "Unknown Model" }.orEmpty()
+    private fun readDeviceDisplayName(device: ConnectedDevice, identifier: String, props: DeviceProps): String {
         if (!device.isEmulator) {
+            val model = readModel(props).takeUnless { it == "Unknown Model" }.orEmpty()
             return model.ifBlank { identifier }
         }
 
@@ -589,16 +532,23 @@ internal class ProxyCommanderController private constructor(
         }
 
         val processName = detectPortOwnerProcessName()?.trim().orEmpty()
-        if (processName.contains("charles", ignoreCase = true)) {
+        if (processName.isNotBlank()) {
+            val friendlyName = KNOWN_PROXY_PROCESSES
+                .firstOrNull { (token, _) -> processName.contains(token, ignoreCase = true) }
+                ?.second
+                ?: processName
             log("[ProxyCommander] Host port ${config.port} is owned by $processName.")
-            return "Charles"
-        }
-        if (processName.contains("proxyman", ignoreCase = true)) {
-            log("[ProxyCommander] Host port ${config.port} is owned by $processName.")
-            return "Proxyman"
+            return friendlyName
         }
 
-        log("[ProxyCommander] Could not confirm that localhost:${config.port} is Charles or Proxyman. Ensure your proxy app is running on port ${config.port}.")
+        // lsof is unavailable (e.g. Windows), but the probe socket connected, so something is
+        // listening on the port even if we cannot name it.
+        if (probeResponse != null) {
+            log("[ProxyCommander] A proxy answered on localhost:${config.port}.")
+            return "a proxy on localhost:${config.port}"
+        }
+
+        log("[ProxyCommander] Could not confirm that a proxy is listening on localhost:${config.port}. Ensure your proxy app (Charles, Proxyman, mitmproxy, Burp, Fiddler, ...) is running on port ${config.port}.")
         return null
     }
 
@@ -653,13 +603,8 @@ internal class ProxyCommanderController private constructor(
         }.getOrNull()
     }
 
-    private fun isProxyCleared(proxy: String, host: String, port: String, pac: String): Boolean {
-        val proxyCleared = proxy.isBlank() || proxy == "null" || proxy == ":0"
-        val hostCleared = host.isBlank() || host == "null"
-        val portCleared = port.isBlank() || port == "null" || port == "0" || port == "-1"
-        val pacCleared = pac.isBlank() || pac == "null"
-        return proxyCleared && hostCleared && portCleared && pacCleared
-    }
+    private fun isProxyCleared(proxy: String, host: String, port: String, pac: String): Boolean =
+        ProxyCommanderParsing.isProxyCleared(proxy, host, port, pac)
 
     private fun startAdbServer() {
         adbClient.run(args = listOf("start-server"), allowFailure = true)
@@ -857,18 +802,7 @@ internal class ProxyCommanderController private constructor(
         }
 
         private fun parseTrackedDevicesSnapshot(snapshot: String): Set<String> =
-            snapshot.lineSequence()
-                .map { it.trim() }
-                .filter { it.isNotEmpty() }
-                .mapNotNull { line ->
-                    val columns = line.split(Regex("\\s+"))
-                    if (columns.size < 2 || columns[1] != "device") {
-                        null
-                    } else {
-                        columns[0]
-                    }
-                }
-                .toSet()
+            ProxyCommanderParsing.parseTrackedDevicesSnapshot(snapshot)
 
         private fun existingFile(path: String?): File? {
             if (path.isNullOrBlank()) {
@@ -933,11 +867,27 @@ internal class ProxyCommanderController private constructor(
         }
     }
 
+    private class DeviceProps(private val map: Map<String, String>) {
+        // getprop renders an unset property as an empty value; treat blank and "null" as absent.
+        fun get(key: String): String =
+            map[key]?.trim()?.takeUnless { it == "null" }.orEmpty()
+    }
+
     private companion object {
         const val COMMAND_UNAVAILABLE_EXIT_CODE = -3
         const val ADB_TRACK_HEADER_SIZE = 4
         const val MAX_PROXY_PROBE_RESPONSE_CHARS = 8_192
-        val EMULATOR_SERIAL_REGEX = Regex("^emulator-[0-9]+$")
+
+        // (substring to match in the listening process name) -> (display name)
+        val KNOWN_PROXY_PROCESSES = listOf(
+            "charles" to "Charles",
+            "proxyman" to "Proxyman",
+            "mitmproxy" to "mitmproxy",
+            "mitmdump" to "mitmproxy",
+            "mitmweb" to "mitmproxy",
+            "burp" to "Burp Suite",
+            "fiddler" to "Fiddler"
+        )
     }
 
     private data class AdbResolution(

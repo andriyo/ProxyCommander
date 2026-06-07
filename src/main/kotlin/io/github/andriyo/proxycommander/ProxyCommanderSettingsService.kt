@@ -1,17 +1,17 @@
 package io.github.andriyo.proxycommander
 
+import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.components.PersistentStateComponent
 import com.intellij.openapi.components.Service
 import com.intellij.openapi.components.State
 import com.intellij.openapi.components.Storage
-import com.intellij.openapi.project.Project
 
 internal data class RememberedDevice(
     val id: String,
     val name: String
 )
 
-@Service(Service.Level.PROJECT)
+@Service(Service.Level.APP)
 @State(name = "ProxyCommanderSettings", storages = [Storage("proxyCommander.xml")])
 class ProxyCommanderSettingsService : PersistentStateComponent<ProxyCommanderSettingsService.State> {
 
@@ -97,6 +97,27 @@ class ProxyCommanderSettingsService : PersistentStateComponent<ProxyCommanderSet
         state.rememberedDeviceIds = mutableListOf()
     }
 
+    /**
+     * Folds settings persisted by an older, project-level build into the application-level state.
+     * Customized application values win, so opening several migrated projects never clobbers a
+     * port/adb path the user already adjusted; remembered devices from every project are unioned.
+     */
+    @Synchronized
+    internal fun importLegacyState(legacy: State) {
+        if (state.port == DEFAULT_PORT && legacy.port in 1..65535 && legacy.port != DEFAULT_PORT) {
+            state.port = legacy.port
+        }
+        if (state.adbPath.isBlank() && legacy.adbPath.isNotBlank()) {
+            state.adbPath = legacy.adbPath.trim()
+        }
+        val legacyDevices = legacy.rememberedDevices
+            .map { RememberedDevice(id = it.id, name = it.name) }
+            .ifEmpty { legacy.rememberedDeviceIds.map { RememberedDevice(id = it, name = it) } }
+        if (legacyDevices.isNotEmpty()) {
+            rememberDevices(legacyDevices)
+        }
+    }
+
     private fun normalizeDevices(devices: Collection<RememberedDevice>): MutableList<RememberedDeviceState> =
         devices
             .asSequence()
@@ -115,7 +136,7 @@ class ProxyCommanderSettingsService : PersistentStateComponent<ProxyCommanderSet
     companion object {
         const val DEFAULT_PORT = 8888
 
-        fun getInstance(project: Project): ProxyCommanderSettingsService =
-            project.getService(ProxyCommanderSettingsService::class.java)
+        fun getInstance(): ProxyCommanderSettingsService =
+            ApplicationManager.getApplication().getService(ProxyCommanderSettingsService::class.java)
     }
 }

@@ -36,39 +36,49 @@ offered, to avoid notification noise at startup.
 ## Connection testing
 
 The Devices dialog can verify a device end-to-end: it confirms the device proxy points at
-`localhost:<port>`, the reverse mapping is enabled, and a supported host proxy (Charles or
-Proxyman) is actually listening on `<port>`.
+`localhost:<port>`, the reverse mapping is enabled, and a host proxy is actually listening on
+`<port>`. Charles, Proxyman, mitmproxy, Burp, and Fiddler are recognized by name; any other process
+listening on the port is reported generically.
+
+## Status bar
+
+A status bar widget shows the configured port and the number of connected devices (`Proxy :8888 (2)`).
+Click it to open the Devices dialog. The Devices dialog also refreshes live as devices connect and
+disconnect.
 
 ## Settings
 
-`Tools -> Proxy Commander -> Settings...`
+`Settings/Preferences -> Tools -> Proxy Commander` (also reachable via
+`Tools -> Proxy Commander -> Settings...`). Settings are application-wide and shared across all open
+projects; a single background watcher serves every project. Settings from older per-project builds are
+migrated automatically the first time a project opens.
 
 - `Port` (default: `8888`)
 - `ADB Path` (optional). When empty, adb is resolved in order: `$ADB`, the Android SDK
   (`local.properties` `sdk.dir`, `ANDROID_SDK_ROOT`, `ANDROID_HOME`, or standard SDK
   locations), then `adb` on `PATH`.
-- `Reset device clock on connect` (enabled by default, toggles automatic time/timezone to force resync)
+- `Reset device clock on connect` (enabled by default; aligns the device clock to host time via
+  `time_detector`, which works offline without NTP reachability)
 
 ## Installation
 
 1. Build plugin ZIP:
 
 ```bash
-cd /Users/andrii/IdeaProjects/ProxyCommander
 ./gradlew buildPlugin
 ```
 
 2. Install from disk in Android Studio:
    - `Settings/Preferences -> Plugins`
    - gear icon -> `Install Plugin from Disk...`
-   - select:
-     `build/distributions/ProxyCommander-1.0-SNAPSHOT.zip`
+   - select the ZIP under `build/distributions/` (e.g. `ProxyCommander-1.3.0.zip`)
 3. Restart Android Studio.
 
 ## Run in sandbox (development)
 
 ```bash
-./gradlew runIde -PandroidStudioPath="/Users/andrii/Applications/Android Studio.app/Contents"
+# Point -PandroidStudioPath at your local Android Studio install:
+./gradlew runIde -PandroidStudioPath="/Applications/Android Studio.app/Contents"
 ```
 
 ## Integration Tests (real adb + devices)

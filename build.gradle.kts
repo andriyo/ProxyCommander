@@ -5,7 +5,7 @@ plugins {
 }
 
 group = "io.github.andriyo"
-version = "1.2.0"
+version = "1.3.0"
 
 val androidStudioVersion = providers.gradleProperty("androidStudioVersion").orElse("2024.2.1.11")
 val androidStudioPath = providers.gradleProperty("androidStudioPath")
@@ -41,6 +41,15 @@ intellijPlatform {
         }
 
         changeNotes = """
+            <h3>1.3.0</h3>
+            <ul>
+              <li>New: <b>status bar widget</b> showing the proxy port and connected-device count; click it to open the Devices dialog.</li>
+              <li>New: the <b>Devices dialog updates live</b> as devices connect and disconnect, instead of needing a manual Refresh.</li>
+              <li>Changed: settings are now <b>application-wide</b> (Settings &rarr; Tools &rarr; Proxy Commander) and shared across projects, with a single background watcher instead of one per open project. Existing per-project settings are migrated automatically.</li>
+              <li>Better: the host-proxy connection test now recognizes <b>mitmproxy, Burp, and Fiddler</b> (not just Charles/Proxyman) and reports any other process listening on the port.</li>
+              <li>Better: auto-reconnect no longer blocks device tracking while a device boots; device details are read with a single <code>getprop</code> call.</li>
+              <li>Notifications are now a registered group, configurable under Settings &rarr; Notifications.</li>
+            </ul>
             <h3>1.2.0</h3>
             <ul>
               <li>New: <b>auto-reconnect</b> remembered devices when they reappear. A background <code>adb track-devices</code> watcher restores reverse/proxy without a manual action.</li>
