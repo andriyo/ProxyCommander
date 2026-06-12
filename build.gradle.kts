@@ -5,7 +5,7 @@ plugins {
 }
 
 group = "io.github.andriyo"
-version = "1.3.0"
+version = "1.4.0"
 
 val androidStudioVersion = providers.gradleProperty("androidStudioVersion").orElse("2024.2.1.11")
 val androidStudioPath = providers.gradleProperty("androidStudioPath")
@@ -41,6 +41,19 @@ intellijPlatform {
         }
 
         changeNotes = """
+            <h3>1.4.0</h3>
+            <ul>
+              <li>New: per-device <b>Unproxy</b> and <b>Forget</b> (disable auto-connect) buttons in the Devices dialog.</li>
+              <li>New: the "new device" offer has a <b>Don't Offer Again</b> action; muted devices never trigger the offer again (connecting one unmutes it).</li>
+              <li>New: <b>Connect Proxy to Current</b> now works with physical devices, not just emulators.</li>
+              <li>New: the status bar widget shows <b>proxied/connected counts</b> (e.g. <code>Proxy :8888 (1/2)</code>) and opens a quick-action popup.</li>
+              <li>Better: changing the port now cleans up reverse mappings left over from the previous port on connect/disconnect.</li>
+              <li>Better: the host-proxy connection test can name the listening process on <b>Windows</b> too (netstat/tasklist).</li>
+              <li>Better: device details load in parallel, so the Devices dialog opens faster with many devices.</li>
+              <li>Fixed: adb commands with large output (e.g. <code>getprop</code> on prop-heavy devices) no longer stall until the timeout.</li>
+              <li>Fixed: the clock-reset step now reports honestly when <code>time_detector</code> is unsupported instead of claiming success.</li>
+              <li>Fixed: migration from per-project settings now preserves a disabled "Reset device clock on connect".</li>
+            </ul>
             <h3>1.3.0</h3>
             <ul>
               <li>New: <b>status bar widget</b> showing the proxy port and connected-device count; click it to open the Devices dialog.</li>

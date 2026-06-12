@@ -11,6 +11,8 @@ internal data class RememberedDevice(
     val name: String
 )
 
+internal val VALID_PORT_RANGE = 1..65535
+
 @Service(Service.Level.APP)
 @State(name = "ProxyCommanderSettings", storages = [Storage("proxyCommander.xml")])
 class ProxyCommanderSettingsService : PersistentStateComponent<ProxyCommanderSettingsService.State> {
@@ -25,7 +27,9 @@ class ProxyCommanderSettingsService : PersistentStateComponent<ProxyCommanderSet
         var adbPath: String = "",
         var resetTimeOnConnect: Boolean = true,
         var rememberedDeviceIds: MutableList<String> = mutableListOf(),
-        var rememberedDevices: MutableList<RememberedDeviceState> = mutableListOf()
+        var rememberedDevices: MutableList<RememberedDeviceState> = mutableListOf(),
+        var ignoredDeviceIds: MutableList<String> = mutableListOf(),
+        var previousPorts: MutableList<Int> = mutableListOf()
     )
 
     private var state = State()
@@ -47,20 +51,31 @@ class ProxyCommanderSettingsService : PersistentStateComponent<ProxyCommanderSet
             )
         }
         this.state.rememberedDeviceIds = this.state.rememberedDevices.map { it.id }.toMutableList()
+        this.state.ignoredDeviceIds = normalizeIds(this.state.ignoredDeviceIds)
+        this.state.previousPorts = sanitizePorts(this.state.previousPorts).toMutableList()
     }
 
     @Synchronized
     internal fun getConfig(): ProxyCommanderConfig {
-        val validPort = state.port.takeIf { it in 1..65535 } ?: DEFAULT_PORT
+        val validPort = state.port.takeIf { it in VALID_PORT_RANGE } ?: DEFAULT_PORT
         return ProxyCommanderConfig(
             port = validPort,
             adbPath = state.adbPath.trim(),
-            resetTimeOnConnect = state.resetTimeOnConnect
+            resetTimeOnConnect = state.resetTimeOnConnect,
+            previousPorts = sanitizePorts(state.previousPorts).toSet()
         )
     }
 
     @Synchronized
     internal fun updateConfig(port: Int, adbPath: String, resetTimeOnConnect: Boolean) {
+        if (port != state.port && state.port in VALID_PORT_RANGE) {
+            // Keep a short history of earlier ports so connect/disconnect can clean up reverse
+            // mappings that were applied before a port change.
+            state.previousPorts = sanitizePorts(state.previousPorts + state.port)
+                .filter { it != port }
+                .takeLast(MAX_PREVIOUS_PORTS)
+                .toMutableList()
+        }
         state.port = port
         state.adbPath = adbPath.trim()
         state.resetTimeOnConnect = resetTimeOnConnect
@@ -79,22 +94,47 @@ class ProxyCommanderSettingsService : PersistentStateComponent<ProxyCommanderSet
         devices.forEach { device ->
             merged[device.id] = device
         }
-        val normalized = normalizeDevices(merged.values)
-        state.rememberedDevices = normalized
-        state.rememberedDeviceIds = normalized.map { it.id }.toMutableList()
+        applyRememberedDevices(normalizeDevices(merged.values))
     }
 
     @Synchronized
     internal fun replaceRememberedDevices(devices: Collection<RememberedDevice>) {
-        val normalized = normalizeDevices(devices)
-        state.rememberedDevices = normalized
-        state.rememberedDeviceIds = normalized.map { it.id }.toMutableList()
+        applyRememberedDevices(normalizeDevices(devices))
+    }
+
+    @Synchronized
+    internal fun forgetDevice(id: String) {
+        val trimmed = id.trim()
+        val remaining = getRememberedDevices().filterNot { it.id == trimmed }
+        state.rememberedDevices = normalizeDevices(remaining)
+        state.rememberedDeviceIds = state.rememberedDevices.map { it.id }.toMutableList()
     }
 
     @Synchronized
     internal fun clearRememberedDevices() {
         state.rememberedDevices = mutableListOf()
         state.rememberedDeviceIds = mutableListOf()
+    }
+
+    @Synchronized
+    internal fun getIgnoredDeviceIds(): Set<String> = state.ignoredDeviceIds.toSet()
+
+    /** Suppresses the "connect this new device?" offer for the device permanently. */
+    @Synchronized
+    internal fun ignoreDevice(id: String) {
+        val trimmed = id.trim()
+        if (trimmed.isEmpty() || trimmed in state.ignoredDeviceIds) {
+            return
+        }
+        state.ignoredDeviceIds = normalizeIds(state.ignoredDeviceIds + trimmed)
+    }
+
+    private fun applyRememberedDevices(normalized: MutableList<RememberedDeviceState>) {
+        state.rememberedDevices = normalized
+        state.rememberedDeviceIds = normalized.map { it.id }.toMutableList()
+        // Connecting a device is an explicit opt-in, so it stops being ignored.
+        val rememberedIds = normalized.map { it.id }.toSet()
+        state.ignoredDeviceIds = normalizeIds(state.ignoredDeviceIds.filterNot { it in rememberedIds })
     }
 
     /**
@@ -104,11 +144,15 @@ class ProxyCommanderSettingsService : PersistentStateComponent<ProxyCommanderSet
      */
     @Synchronized
     internal fun importLegacyState(legacy: State) {
-        if (state.port == DEFAULT_PORT && legacy.port in 1..65535 && legacy.port != DEFAULT_PORT) {
+        if (state.port == DEFAULT_PORT && legacy.port in VALID_PORT_RANGE && legacy.port != DEFAULT_PORT) {
             state.port = legacy.port
         }
         if (state.adbPath.isBlank() && legacy.adbPath.isNotBlank()) {
             state.adbPath = legacy.adbPath.trim()
+        }
+        if (state.resetTimeOnConnect && !legacy.resetTimeOnConnect) {
+            // The default is true, so a legacy `false` is a deliberate user choice worth keeping.
+            state.resetTimeOnConnect = false
         }
         val legacyDevices = legacy.rememberedDevices
             .map { RememberedDevice(id = it.id, name = it.name) }
@@ -133,8 +177,20 @@ class ProxyCommanderSettingsService : PersistentStateComponent<ProxyCommanderSet
             .map { RememberedDeviceState(id = it.id, name = it.name) }
             .toMutableList()
 
+    private fun normalizeIds(ids: Collection<String>): MutableList<String> =
+        ids.asSequence()
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+            .distinct()
+            .sorted()
+            .toMutableList()
+
+    private fun sanitizePorts(ports: Collection<Int>): List<Int> =
+        ports.filter { it in VALID_PORT_RANGE }.distinct()
+
     companion object {
         const val DEFAULT_PORT = 8888
+        private const val MAX_PREVIOUS_PORTS = 8
 
         fun getInstance(): ProxyCommanderSettingsService =
             ApplicationManager.getApplication().getService(ProxyCommanderSettingsService::class.java)

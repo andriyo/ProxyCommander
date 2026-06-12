@@ -1,15 +1,17 @@
 package io.github.andriyo.proxycommander
 
+import com.intellij.openapi.actionSystem.ActionManager
+import com.intellij.openapi.actionSystem.DefaultActionGroup
+import com.intellij.openapi.actionSystem.impl.SimpleDataContext
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.application.ModalityState
 import com.intellij.openapi.project.Project
+import com.intellij.openapi.ui.popup.JBPopup
+import com.intellij.openapi.ui.popup.JBPopupFactory
 import com.intellij.openapi.util.Disposer
 import com.intellij.openapi.wm.StatusBar
 import com.intellij.openapi.wm.StatusBarWidget
 import com.intellij.openapi.wm.StatusBarWidgetFactory
-import com.intellij.util.Consumer
-import java.awt.Component
-import java.awt.event.MouseEvent
 
 class ProxyCommanderStatusBarWidgetFactory : StatusBarWidgetFactory {
     override fun getId(): String = WIDGET_ID
@@ -32,12 +34,12 @@ class ProxyCommanderStatusBarWidgetFactory : StatusBarWidgetFactory {
 }
 
 /**
- * Glanceable status of the proxy: configured port plus the number of connected devices, fed cheaply
- * from the watcher's latest device snapshot. Clicking opens the Devices dialog. The text deliberately
- * avoids per-device proxy probing so the widget never triggers adb polling of its own.
+ * Glanceable status of the proxy: configured port plus proxied/connected device counts, fed
+ * cheaply from the watcher's latest snapshot so the widget never triggers adb polling of its own.
+ * Clicking opens a popup with the plugin's actions.
  */
 private class ProxyCommanderStatusBarWidget(private val project: Project) :
-    StatusBarWidget, StatusBarWidget.TextPresentation {
+    StatusBarWidget, StatusBarWidget.MultipleTextValuesPresentation {
 
     private var statusBar: StatusBar? = null
 
@@ -57,28 +59,61 @@ private class ProxyCommanderStatusBarWidget(private val project: Project) :
 
     override fun getPresentation(): StatusBarWidget.WidgetPresentation = this
 
-    override fun getText(): String {
+    override fun getSelectedValue(): String {
         val port = ProxyCommanderSettingsService.getInstance().getConfig().port
-        val count = ProxyCommanderReconnectService.getInstance().connectedSerials().size
-        return "Proxy :$port ($count)"
+        val service = ProxyCommanderReconnectService.getInstance()
+        val connected = service.connectedSerials().size
+        val proxied = service.proxiedSerials().size
+        return "Proxy :$port ($proxied/$connected)"
     }
-
-    override fun getAlignment(): Float = Component.CENTER_ALIGNMENT
 
     override fun getTooltipText(): String {
-        val count = ProxyCommanderReconnectService.getInstance().connectedSerials().size
-        val devices = if (count == 1) "device" else "devices"
-        return "Proxy Commander — $count $devices available. Click to manage."
+        val service = ProxyCommanderReconnectService.getInstance()
+        val connected = service.connectedSerials().size
+        val proxied = service.proxiedSerials().size
+        val devices = if (connected == 1) "device" else "devices"
+        return "Proxy Commander — $proxied of $connected connected $devices proxied. Click for actions."
     }
 
-    override fun getClickConsumer(): Consumer<MouseEvent> = Consumer {
-        if (!project.isDisposed) {
-            ProxyCommanderUi.openDevicesDialog(project)
+    override fun getPopup(): JBPopup? {
+        if (project.isDisposed) {
+            return null
         }
+
+        val actionManager = ActionManager.getInstance()
+        val group = DefaultActionGroup()
+        POPUP_ACTION_IDS.forEach { actionId ->
+            if (actionId == null) {
+                group.addSeparator()
+            } else {
+                actionManager.getAction(actionId)?.let(group::add)
+            }
+        }
+
+        return JBPopupFactory.getInstance().createActionGroupPopup(
+            "Proxy Commander",
+            group,
+            SimpleDataContext.getProjectContext(project),
+            JBPopupFactory.ActionSelectionAid.SPEEDSEARCH,
+            true
+        )
     }
 
     override fun dispose() {
         ProxyCommanderReconnectService.getInstance().removeListener(devicesListener)
         statusBar = null
+    }
+
+    private companion object {
+        // null marks a separator.
+        val POPUP_ACTION_IDS = listOf(
+            "ProxyCommander.KeepSelectedDeviceAction",
+            null,
+            "ProxyCommander.ConnectAllDevicesAction",
+            "ProxyCommander.ConnectActiveEmulatorClearOthersProxyAction",
+            "ProxyCommander.DisconnectAllDevicesAction",
+            null,
+            "ProxyCommander.SettingsAction"
+        )
     }
 }

@@ -2,16 +2,17 @@ package io.github.andriyo.proxycommander
 
 import com.intellij.openapi.project.Project
 import java.io.File
-import java.io.IOException
 import java.net.InetSocketAddress
 import java.net.Socket
-import java.util.Properties
-import java.util.concurrent.TimeUnit
+import java.util.concurrent.Callable
+import java.util.concurrent.Executors
 
 internal data class ProxyCommanderConfig(
     val port: Int = ProxyCommanderSettingsService.DEFAULT_PORT,
     val adbPath: String = "",
-    val resetTimeOnConnect: Boolean = true
+    val resetTimeOnConnect: Boolean = true,
+    /** Ports the plugin used before the current one; their reverse mappings get cleaned up. */
+    val previousPorts: Set<Int> = emptySet()
 )
 
 internal data class ConnectedDevice(
@@ -34,8 +35,8 @@ internal data class ConnectedEmulator(
     val model: String
 )
 
-internal class ProxyCommanderController private constructor(
-    private val adbClient: AdbClient,
+internal class ProxyCommanderController internal constructor(
+    private val adbClient: AdbCommander,
     private val config: ProxyCommanderConfig
 ) {
     constructor(project: Project, config: ProxyCommanderConfig) : this(
@@ -85,19 +86,48 @@ internal class ProxyCommanderController private constructor(
 
     fun listConnectedDeviceDetails(log: (String) -> Unit = {}): List<ConnectedDeviceDetails> {
         val devices = listConnectedDevices(log)
-        return devices.map { device ->
-            // One `getprop` dump per device instead of a separate adb call for each property.
-            val props = readDeviceProps(device.serial)
-            val identifier = readDeviceIdentifier(device, props)
-            ConnectedDeviceDetails(
-                identifier = identifier,
-                serial = device.serial,
-                name = readDeviceDisplayName(device, identifier, props),
-                apiLevel = readApiLevel(props),
-                isEmulator = device.isEmulator,
-                isProxyConnected = isProxyConnected(device.serial)
-            )
+        if (devices.isEmpty()) {
+            return emptyList()
         }
+        if (devices.size == 1) {
+            return listOf(readConnectedDeviceDetails(devices.single()))
+        }
+
+        // Each device costs several adb round trips; reading them in parallel keeps the Devices
+        // dialog and snapshot processing responsive when several devices are attached.
+        val executor = Executors.newFixedThreadPool(minOf(devices.size, MAX_DETAIL_READ_THREADS))
+        return try {
+            devices
+                .map { device -> device to executor.submit(Callable { readConnectedDeviceDetails(device) }) }
+                .map { (device, future) ->
+                    runCatching { future.get() }.getOrElse {
+                        ConnectedDeviceDetails(
+                            identifier = device.serial,
+                            serial = device.serial,
+                            name = device.serial,
+                            apiLevel = "?",
+                            isEmulator = device.isEmulator,
+                            isProxyConnected = false
+                        )
+                    }
+                }
+        } finally {
+            executor.shutdown()
+        }
+    }
+
+    private fun readConnectedDeviceDetails(device: ConnectedDevice): ConnectedDeviceDetails {
+        // One `getprop` dump per device instead of a separate adb call for each property.
+        val props = readDeviceProps(device.serial)
+        val identifier = readDeviceIdentifier(device, props)
+        return ConnectedDeviceDetails(
+            identifier = identifier,
+            serial = device.serial,
+            name = readDeviceDisplayName(device, identifier, props),
+            apiLevel = readApiLevel(props),
+            isEmulator = device.isEmulator,
+            isProxyConnected = isProxyConnected(device.serial)
+        )
     }
 
     fun connectAllDevices(log: (String) -> Unit): Boolean {
@@ -130,6 +160,15 @@ internal class ProxyCommanderController private constructor(
             return false
         }
         return connectSerial(serial, log)
+    }
+
+    fun disconnectDevice(serial: String, log: (String) -> Unit): Boolean {
+        val exists = listConnectedDevices(log).any { it.serial == serial }
+        if (!exists) {
+            log("[ProxyCommander] Device '$serial' is not connected.")
+            return false
+        }
+        return disconnectSerial(serial, log)
     }
 
     fun disconnectAllDevices(log: (String) -> Unit): Boolean {
@@ -186,31 +225,27 @@ internal class ProxyCommanderController private constructor(
         return !failed
     }
 
-    fun connectEmulatorAndClearProxyOnOthers(activeEmulatorSerial: String, log: (String) -> Unit): Boolean {
+    fun connectDeviceAndClearProxyOnOthers(activeSerial: String, log: (String) -> Unit): Boolean {
         val devices = listConnectedDevices(log)
         if (devices.isEmpty()) {
             log("[ProxyCommander] No connected devices in 'device' state.")
             return false
         }
 
-        val activeDevice = devices.firstOrNull { it.serial == activeEmulatorSerial }
+        val activeDevice = devices.firstOrNull { it.serial == activeSerial }
         if (activeDevice == null) {
-            log("[ProxyCommander] Active emulator '$activeEmulatorSerial' is not connected.")
-            return false
-        }
-        if (!activeDevice.isEmulator) {
-            log("[ProxyCommander] Active device '$activeEmulatorSerial' is not an emulator.")
+            log("[ProxyCommander] Active device '$activeSerial' is not connected.")
             return false
         }
 
         var failed = false
-        if (!connectSerial(activeEmulatorSerial, log)) {
+        if (!connectSerial(activeSerial, log)) {
             failed = true
         }
 
-        val others = devices.filterNot { it.serial == activeEmulatorSerial }
+        val others = devices.filterNot { it.serial == activeSerial }
         if (others.isEmpty()) {
-            log("[ProxyCommander] Active emulator '$activeEmulatorSerial' is the only connected device.")
+            log("[ProxyCommander] Active device '$activeSerial' is the only connected device.")
             return !failed
         }
 
@@ -222,9 +257,9 @@ internal class ProxyCommanderController private constructor(
         }
 
         if (failed) {
-            log("[ProxyCommander] Finished with errors while connecting active emulator and clearing proxies on others.")
+            log("[ProxyCommander] Finished with errors while connecting active device and clearing proxies on others.")
         } else {
-            log("[ProxyCommander] Active emulator connected and proxies cleared on all other connected devices.")
+            log("[ProxyCommander] Active device connected and proxies cleared on all other connected devices.")
         }
         return !failed
     }
@@ -295,6 +330,7 @@ internal class ProxyCommanderController private constructor(
     }
 
     private fun connectSerial(serial: String, log: (String) -> Unit): Boolean {
+        removeStaleReverseMappings(serial, log)
         val reverseEnabled = enableReverse(serial, log)
         val proxyConfigured = setDeviceProxy(serial, log)
         if (config.resetTimeOnConnect) {
@@ -335,17 +371,24 @@ internal class ProxyCommanderController private constructor(
             "--unix_epoch_time", hostEpochMs.toString()
         )
 
-        adbClient.run(
+        val setResult = adbClient.run(
             serial,
             listOf("shell", "cmd", "time_detector", "set_time_state_for_tests") + reference +
                 listOf("--user_should_confirm_time", "false"),
             allowFailure = true
         )
-        adbClient.run(
+        val confirmResult = adbClient.run(
             serial,
             listOf("shell", "cmd", "time_detector", "confirm_time") + reference,
             allowFailure = true
         )
+
+        val setApplied = setResult.success && !ProxyCommanderParsing.looksLikeCmdFailure(setResult.output)
+        val confirmApplied = confirmResult.success && !ProxyCommanderParsing.looksLikeCmdFailure(confirmResult.output)
+        if (!setApplied && !confirmApplied) {
+            log("[ProxyCommander] Could not force clock on $serial via time_detector (not supported on this Android version?): ${setResult.briefOutput()}")
+            return
+        }
 
         val stateResult = adbClient.run(
             serial,
@@ -360,6 +403,7 @@ internal class ProxyCommanderController private constructor(
 
     private fun disconnectSerial(serial: String, log: (String) -> Unit): Boolean {
         val reverseRemoved = removeReverse(serial, log)
+        removeStaleReverseMappings(serial, log)
         val proxyCleared = clearDeviceProxy(serial, log)
         return reverseRemoved && proxyCleared
     }
@@ -385,6 +429,29 @@ internal class ProxyCommanderController private constructor(
         adbClient.run(serial, listOf("reverse", "--remove", reverseToken), allowFailure = true)
         log("[ProxyCommander] Reverse removal attempted for $serial on $reverseToken")
         return true
+    }
+
+    // Reverse mappings applied before a port change would otherwise linger on the device forever:
+    // a later connect/disconnect only ever touches the current port's token.
+    private fun removeStaleReverseMappings(serial: String, log: (String) -> Unit) {
+        val staleTokens = config.previousPorts
+            .filter { it != config.port }
+            .map { "tcp:$it" }
+        if (staleTokens.isEmpty()) {
+            return
+        }
+
+        val listResult = adbClient.run(serial, listOf("reverse", "--list"), allowFailure = true)
+        if (!listResult.success) {
+            return
+        }
+
+        staleTokens
+            .filter { ProxyCommanderParsing.containsReverseMapping(listResult.output, it) }
+            .forEach { token ->
+                adbClient.run(serial, listOf("reverse", "--remove", token), allowFailure = true)
+                log("[ProxyCommander] Removed stale reverse mapping $token for $serial (left over from a previous port)")
+            }
     }
 
     private fun setDeviceProxy(serial: String, log: (String) -> Unit): Boolean {
@@ -541,8 +608,8 @@ internal class ProxyCommanderController private constructor(
             return friendlyName
         }
 
-        // lsof is unavailable (e.g. Windows), but the probe socket connected, so something is
-        // listening on the port even if we cannot name it.
+        // The port owner could not be named, but the probe socket connected, so something is
+        // listening on the port even if we cannot identify it.
         if (probeResponse != null) {
             log("[ProxyCommander] A proxy answered on localhost:${config.port}.")
             return "a proxy on localhost:${config.port}"
@@ -582,289 +649,35 @@ internal class ProxyCommanderController private constructor(
             }
         }.getOrNull()
 
-    private fun detectPortOwnerProcessName(): String? {
-        if (System.getProperty("os.name").contains("Windows", ignoreCase = true)) {
-            return null
+    private fun detectPortOwnerProcessName(): String? =
+        if (isWindowsHost()) {
+            detectPortOwnerProcessNameWindows()
+        } else {
+            detectPortOwnerProcessNameUnix()
         }
 
-        return runCatching {
-            val process = ProcessBuilder("lsof", "-nP", "-iTCP:${config.port}", "-sTCP:LISTEN")
-                .redirectErrorStream(true)
-                .start()
-            process.waitFor(2, TimeUnit.SECONDS)
-            process.inputStream.bufferedReader().use { reader ->
-                reader.lineSequence()
-                    .drop(1)
-                    .map { it.trim() }
-                    .firstOrNull { it.isNotEmpty() }
-                    ?.split(Regex("\\s+"))
-                    ?.firstOrNull()
-            }
-        }.getOrNull()
+    private fun detectPortOwnerProcessNameUnix(): String? {
+        val output = runHostCommand(listOf("lsof", "-nP", "-iTCP:${config.port}", "-sTCP:LISTEN")) ?: return null
+        return ProxyCommanderParsing.parseLsofListeningProcessName(output)
     }
+
+    private fun detectPortOwnerProcessNameWindows(): String? {
+        val netstatOutput = runHostCommand(listOf("netstat", "-ano", "-p", "TCP")) ?: return null
+        val pid = ProxyCommanderParsing.parseNetstatListeningPid(netstatOutput, config.port) ?: return null
+        val tasklistOutput = runHostCommand(listOf("tasklist", "/FI", "PID eq $pid", "/FO", "CSV", "/NH")) ?: return null
+        return ProxyCommanderParsing.parseTasklistProcessName(tasklistOutput)
+    }
+
+    private fun runHostCommand(command: List<String>): String? =
+        (ProcessRunner.run(command, timeoutMs = HOST_COMMAND_TIMEOUT_MS) as? ProcessRunner.Result.Completed)
+            ?.output
+            ?.takeIf { it.isNotBlank() }
 
     private fun isProxyCleared(proxy: String, host: String, port: String, pac: String): Boolean =
         ProxyCommanderParsing.isProxyCleared(proxy, host, port, pac)
 
     private fun startAdbServer() {
         adbClient.run(args = listOf("start-server"), allowFailure = true)
-    }
-
-    private class AdbClient(private val workingDirectory: File?, adbPath: String) {
-        private val configuredAdbPath = adbPath.takeIf { it.isNotBlank() }
-        private val resolution = resolveAdbExecutable()
-        private val adbExecutable = resolution.executable
-        private val defaultTimeoutMs = 10_000L
-
-        fun checkAvailability(): CommandResult =
-            run(args = listOf("version"), allowFailure = true, timeoutMs = 3_000)
-
-        fun trackDevices(
-            shouldStop: () -> Boolean,
-            onSnapshot: (Set<String>) -> Unit,
-            log: (String) -> Unit
-        ): Boolean {
-            val command = listOf(adbExecutable, "track-devices")
-            val process = try {
-                startProcess(command)
-            } catch (error: IOException) {
-                log("[ProxyCommander] ${unavailableMessage()}")
-                return false
-            } catch (error: Exception) {
-                log("[ProxyCommander] ${error.message ?: "Failed to start adb track-devices."}")
-                return false
-            }
-
-            return try {
-                process.inputStream.buffered().use { input ->
-                    while (!shouldStop()) {
-                        if (input.available() < ADB_TRACK_HEADER_SIZE) {
-                            if (!process.isAlive) {
-                                break
-                            }
-                            Thread.sleep(250)
-                            continue
-                        }
-
-                        val header = readTrackFrame(input, ADB_TRACK_HEADER_SIZE) ?: break
-                        val payloadSize = header.toString(Charsets.US_ASCII).toIntOrNull(16)
-                        if (payloadSize == null) {
-                            log("[ProxyCommander] Failed to parse adb track-devices frame header '${header.toString(Charsets.US_ASCII)}'.")
-                            return false
-                        }
-
-                        while (!shouldStop() && input.available() < payloadSize) {
-                            if (!process.isAlive) {
-                                break
-                            }
-                            Thread.sleep(250)
-                        }
-                        if (shouldStop()) {
-                            break
-                        }
-
-                        val payload = if (payloadSize == 0) {
-                            ByteArray(0)
-                        } else {
-                            readTrackFrame(input, payloadSize) ?: break
-                        }
-                        onSnapshot(parseTrackedDevicesSnapshot(payload.toString(Charsets.UTF_8)))
-                    }
-                }
-                true
-            } catch (error: InterruptedException) {
-                Thread.currentThread().interrupt()
-                true
-            } catch (error: Exception) {
-                log("[ProxyCommander] ${error.message ?: "adb track-devices failed."}")
-                false
-            } finally {
-                process.destroyForcibly()
-                runCatching { process.waitFor(200, TimeUnit.MILLISECONDS) }
-            }
-        }
-
-        private fun readTrackFrame(input: java.io.InputStream, size: Int): ByteArray? {
-            if (size == 0) {
-                return ByteArray(0)
-            }
-
-            val buffer = ByteArray(size)
-            var offset = 0
-            while (offset < size) {
-                val read = input.read(buffer, offset, size - offset)
-                if (read < 0) {
-                    return null
-                }
-                offset += read
-            }
-            return buffer
-        }
-
-        fun run(args: List<String>, allowFailure: Boolean = false, timeoutMs: Long = defaultTimeoutMs): CommandResult =
-            run(serial = null, args = args, allowFailure = allowFailure, timeoutMs = timeoutMs)
-
-        fun run(
-            serial: String?,
-            args: List<String>,
-            allowFailure: Boolean = false,
-            timeoutMs: Long = defaultTimeoutMs
-        ): CommandResult {
-            val command = mutableListOf(adbExecutable)
-            if (!serial.isNullOrBlank()) {
-                command += listOf("-s", serial)
-            }
-            command += args
-
-            return try {
-                val process = startProcess(command)
-                val finished = process.waitFor(timeoutMs, TimeUnit.MILLISECONDS)
-                if (!finished) {
-                    process.destroyForcibly()
-                    process.waitFor(200, TimeUnit.MILLISECONDS)
-                    return CommandResult(
-                        exitCode = -2,
-                        output = "Timed out after ${timeoutMs}ms",
-                        command = command
-                    )
-                }
-
-                val output = process.inputStream.bufferedReader().use { it.readText() }.trim()
-                val exitCode = process.exitValue()
-                CommandResult(exitCode = exitCode, output = output, command = command)
-            } catch (error: IOException) {
-                CommandResult(
-                    exitCode = COMMAND_UNAVAILABLE_EXIT_CODE,
-                    output = unavailableMessage(),
-                    command = command
-                )
-            } catch (error: Exception) {
-                CommandResult(
-                    exitCode = -1,
-                    output = error.message ?: "Failed to execute adb command.",
-                    command = command
-                )
-            }
-        }
-
-        private fun startProcess(command: List<String>): Process {
-            val processBuilder = ProcessBuilder(command)
-            workingDirectory?.let(processBuilder::directory)
-            processBuilder.redirectErrorStream(true)
-            return processBuilder.start()
-        }
-
-        private fun unavailableMessage(): String = when (resolution.source) {
-            AdbSource.CONFIGURED_PATH ->
-                "ADB executable at '$adbExecutable' could not be launched. Update Proxy Commander Settings > ADB Path."
-            AdbSource.ENV_ADB ->
-                "ADB executable from \$ADB at '$adbExecutable' could not be launched. Fix \$ADB or set Proxy Commander Settings > ADB Path."
-            AdbSource.PATH ->
-                "ADB command is not available. The plugin could not autodetect adb from the Android SDK. Add adb to PATH or set Proxy Commander Settings > ADB Path."
-            else ->
-                "Autodetected adb at '$adbExecutable' could not be launched. Set Proxy Commander Settings > ADB Path explicitly."
-        }
-
-        private fun resolveAdbExecutable(): AdbResolution {
-            configuredAdbPath?.let {
-                return AdbResolution(it, AdbSource.CONFIGURED_PATH)
-            }
-
-            val envAdbPath = System.getenv("ADB").takeUnless { it.isNullOrBlank() }
-            existingFile(envAdbPath)?.let {
-                return AdbResolution(it.absolutePath, AdbSource.ENV_ADB)
-            }
-
-            val localPropertiesSdk = findLocalPropertiesSdkDir(workingDirectory)
-            sdkAdbCandidate(localPropertiesSdk)?.let {
-                return AdbResolution(it.absolutePath, AdbSource.LOCAL_PROPERTIES)
-            }
-
-            val androidSdkRoot = System.getenv("ANDROID_SDK_ROOT").takeUnless { it.isNullOrBlank() }
-            sdkAdbCandidate(androidSdkRoot)?.let {
-                return AdbResolution(it.absolutePath, AdbSource.ANDROID_SDK_ROOT)
-            }
-
-            val androidHome = System.getenv("ANDROID_HOME").takeUnless { it.isNullOrBlank() }
-            sdkAdbCandidate(androidHome)?.let {
-                return AdbResolution(it.absolutePath, AdbSource.ANDROID_HOME)
-            }
-
-            standardSdkCandidates().firstNotNullOfOrNull(::sdkAdbCandidate)?.let {
-                return AdbResolution(it.absolutePath, AdbSource.STANDARD_SDK_LOCATION)
-            }
-
-            envAdbPath?.let {
-                return AdbResolution(it, AdbSource.ENV_ADB)
-            }
-
-            return AdbResolution("adb", AdbSource.PATH)
-        }
-
-        private fun parseTrackedDevicesSnapshot(snapshot: String): Set<String> =
-            ProxyCommanderParsing.parseTrackedDevicesSnapshot(snapshot)
-
-        private fun existingFile(path: String?): File? {
-            if (path.isNullOrBlank()) {
-                return null
-            }
-            val file = File(path)
-            return file.takeIf { it.isFile }
-        }
-
-        private fun sdkAdbCandidate(sdkDir: String?): File? {
-            if (sdkDir.isNullOrBlank()) {
-                return null
-            }
-            val candidate = File(File(sdkDir), "platform-tools/${adbExecutableName()}")
-            return candidate.takeIf { it.isFile }
-        }
-
-        private fun findLocalPropertiesSdkDir(projectDir: File?): String? {
-            val localProperties = projectDir?.resolve("local.properties") ?: return null
-            if (!localProperties.isFile) {
-                return null
-            }
-
-            return runCatching {
-                val properties = Properties()
-                localProperties.inputStream().use(properties::load)
-                properties.getProperty("sdk.dir")?.trim()?.takeIf { it.isNotEmpty() }
-            }.getOrNull()
-        }
-
-        private fun standardSdkCandidates(): List<String> {
-            val userHome = System.getProperty("user.home").orEmpty()
-            val localAppData = System.getenv("LOCALAPPDATA").orEmpty()
-            return buildList {
-                if (userHome.isNotBlank()) {
-                    add("$userHome/Library/Android/sdk")
-                    add("$userHome/Android/Sdk")
-                }
-                if (localAppData.isNotBlank()) {
-                    add("$localAppData/Android/Sdk")
-                }
-            }
-        }
-
-        private fun adbExecutableName(): String =
-            if (System.getProperty("os.name").contains("Windows", ignoreCase = true)) "adb.exe" else "adb"
-    }
-
-    private data class CommandResult(
-        val exitCode: Int,
-        val output: String,
-        val command: List<String>
-    ) {
-        val success: Boolean
-            get() = exitCode == 0
-        val isCommandUnavailable: Boolean
-            get() = exitCode == COMMAND_UNAVAILABLE_EXIT_CODE
-
-        fun briefOutput(): String {
-            val firstLine = output.lineSequence().firstOrNull().orEmpty().trim()
-            return firstLine.ifBlank { "Command failed: ${command.joinToString(" ")}" }
-        }
     }
 
     private class DeviceProps(private val map: Map<String, String>) {
@@ -874,9 +687,9 @@ internal class ProxyCommanderController private constructor(
     }
 
     private companion object {
-        const val COMMAND_UNAVAILABLE_EXIT_CODE = -3
-        const val ADB_TRACK_HEADER_SIZE = 4
         const val MAX_PROXY_PROBE_RESPONSE_CHARS = 8_192
+        const val MAX_DETAIL_READ_THREADS = 4
+        const val HOST_COMMAND_TIMEOUT_MS = 2_000L
 
         // (substring to match in the listening process name) -> (display name)
         val KNOWN_PROXY_PROCESSES = listOf(
@@ -888,20 +701,5 @@ internal class ProxyCommanderController private constructor(
             "burp" to "Burp Suite",
             "fiddler" to "Fiddler"
         )
-    }
-
-    private data class AdbResolution(
-        val executable: String,
-        val source: AdbSource
-    )
-
-    private enum class AdbSource {
-        CONFIGURED_PATH,
-        ENV_ADB,
-        LOCAL_PROPERTIES,
-        ANDROID_SDK_ROOT,
-        ANDROID_HOME,
-        STANDARD_SDK_LOCATION,
-        PATH
     }
 }

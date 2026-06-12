@@ -23,6 +23,7 @@ class ProxyCommanderReconnectService : Disposable {
     private val baselineEstablished = AtomicBoolean(false)
 
     private val latestSnapshot = AtomicReference<Set<String>>(emptySet())
+    private val latestProxiedSerials = AtomicReference<Set<String>>(emptySet())
     private val pendingSnapshot = AtomicReference<Set<String>?>(null)
     private val listeners = CopyOnWriteArrayList<DevicesListener>()
     private val autoConnectInFlight = Collections.synchronizedSet(HashSet<String>())
@@ -52,6 +53,9 @@ class ProxyCommanderReconnectService : Disposable {
     }
 
     fun connectedSerials(): Set<String> = latestSnapshot.get()
+
+    /** Serials whose proxy + reverse mapping were confirmed by the most recent snapshot pass. */
+    fun proxiedSerials(): Set<String> = latestProxiedSerials.get()
 
     fun refreshTracking() {
         val token = generation.incrementAndGet()
@@ -135,11 +139,14 @@ class ProxyCommanderReconnectService : Disposable {
         // treated as "newly appeared", so the IDE does not flood the user with offers at startup.
         val newSerials = if (isBaseline) emptySet() else snapshotSerials - previouslyKnown
 
-        val settings = ProxyCommanderSettingsService.getInstance()
-        val remembered = settings.getRememberedDeviceIds()
-        if (remembered.isEmpty() && newSerials.isEmpty()) {
+        if (snapshotSerials.isEmpty()) {
+            updateProxiedSerials(emptySet())
             return
         }
+
+        val settings = ProxyCommanderSettingsService.getInstance()
+        val remembered = settings.getRememberedDeviceIds()
+        val ignored = settings.getIgnoredDeviceIds()
 
         val logs = mutableListOf<String>()
         val controller = ProxyCommanderController(currentBasePath(), settings.getConfig())
@@ -148,7 +155,10 @@ class ProxyCommanderReconnectService : Disposable {
             return
         }
 
+        // Details are read on every snapshot (not only when remembered/new devices exist) so the
+        // status bar's proxied count stays accurate.
         val details = controller.listConnectedDeviceDetails(logs::add)
+        updateProxiedSerials(details.filter { it.isProxyConnected }.map { it.serial }.toSet())
 
         details.filter { it.identifier in remembered && !it.isProxyConnected }
             .forEach { device ->
@@ -156,10 +166,21 @@ class ProxyCommanderReconnectService : Disposable {
             }
 
         if (newSerials.isNotEmpty()) {
-            details.filter { it.serial in newSerials && it.identifier !in remembered && !it.isProxyConnected }
-                .forEach { device ->
-                    offerConnectToDevice(device)
-                }
+            details.filter {
+                it.serial in newSerials &&
+                    it.identifier !in remembered &&
+                    it.identifier !in ignored &&
+                    !it.isProxyConnected
+            }.forEach { device ->
+                offerConnectToDevice(device)
+            }
+        }
+    }
+
+    private fun updateProxiedSerials(serials: Set<String>) {
+        val previous = latestProxiedSerials.getAndSet(serials)
+        if (previous != serials) {
+            fireDevicesChanged(latestSnapshot.get())
         }
     }
 
@@ -194,22 +215,23 @@ class ProxyCommanderReconnectService : Disposable {
                 notification.expire()
                 connectAndRememberDevice(serial, identifier, name)
             })
+            notification.addAction(NotificationAction.createSimple("Don't Offer Again") {
+                notification.expire()
+                ProxyCommanderSettingsService.getInstance().ignoreDevice(identifier)
+            })
             Notifications.Bus.notify(notification)
         }
     }
 
     private fun connectAndRememberDevice(serial: String, identifier: String, name: String) {
-        ApplicationManager.getApplication().executeOnPooledThread {
-            val settings = ProxyCommanderSettingsService.getInstance()
-            val logs = mutableListOf<String>()
-            val controller = ProxyCommanderController(currentBasePath(), settings.getConfig())
-            if (!controller.ensureAdbAvailable(logs::add)) {
-                notifyAutoReconnectError(summarize(logs, "ADB command is not available."))
-                return@executeOnPooledThread
-            }
-
-            if (controller.connectDevice(serial, logs::add)) {
-                settings.rememberDevices(listOf(RememberedDevice(identifier, name)))
+        ProxyCommanderExecution.runControllerOperation(
+            projectBasePath = currentBasePath(),
+            config = ProxyCommanderSettingsService.getInstance().getConfig(),
+            operation = { controller, log -> controller.connectDevice(serial, log) }
+        ) { success, logs ->
+            if (success) {
+                ProxyCommanderSettingsService.getInstance()
+                    .rememberDevices(listOf(RememberedDevice(identifier, name)))
                 clearAutoReconnectError()
                 fireDevicesChanged(latestSnapshot.get())
                 refreshTracking()
@@ -274,10 +296,8 @@ class ProxyCommanderReconnectService : Disposable {
     private fun currentBasePath(): String? =
         ProjectManager.getInstance().openProjects.firstOrNull { !it.isDisposed }?.basePath
 
-    private fun summarize(logs: List<String>, fallback: String): String {
-        val lastLog = logs.lastOrNull { it.isNotBlank() }?.removePrefix("[ProxyCommander] ")?.trim()
-        return lastLog.takeUnless { it.isNullOrBlank() } ?: fallback
-    }
+    private fun summarize(logs: List<String>, fallback: String): String =
+        ProxyCommanderExecution.summarize(logs, fallback)
 
     private fun notifyAutoReconnectError(message: String) {
         if (message.isBlank()) {

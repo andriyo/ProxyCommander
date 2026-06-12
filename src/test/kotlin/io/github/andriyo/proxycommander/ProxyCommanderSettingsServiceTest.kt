@@ -1,6 +1,7 @@
 package io.github.andriyo.proxycommander
 
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 
@@ -95,6 +96,70 @@ class ProxyCommanderSettingsServiceTest {
         assertEquals("/custom/adb", config.adbPath)
         // Remembered devices are unioned across the migration.
         assertEquals(listOf("existing", "legacy"), service.getRememberedDevices().map { it.id })
+    }
+
+    @Test
+    fun updateConfig_recordsPreviousPortsOnChange() {
+        val service = service()
+
+        service.updateConfig(port = 9999, adbPath = "", resetTimeOnConnect = true)
+        assertEquals(setOf(8888), service.getConfig().previousPorts)
+
+        service.updateConfig(port = 8080, adbPath = "", resetTimeOnConnect = true)
+        assertEquals(setOf(8888, 9999), service.getConfig().previousPorts)
+
+        // Returning to a previous port drops it from the history.
+        service.updateConfig(port = 8888, adbPath = "", resetTimeOnConnect = true)
+        assertEquals(setOf(9999, 8080), service.getConfig().previousPorts)
+    }
+
+    @Test
+    fun updateConfig_samePortDoesNotGrowHistory() {
+        val service = service()
+        service.updateConfig(port = 8888, adbPath = "", resetTimeOnConnect = true)
+        assertTrue(service.getConfig().previousPorts.isEmpty())
+    }
+
+    @Test
+    fun ignoreDevice_normalizesAndDeduplicates() {
+        val service = service()
+        service.ignoreDevice("  emulator-5554  ")
+        service.ignoreDevice("emulator-5554")
+        service.ignoreDevice("   ")
+
+        assertEquals(setOf("emulator-5554"), service.getIgnoredDeviceIds())
+    }
+
+    @Test
+    fun rememberDevices_clearsIgnoreFlagForConnectedDevice() {
+        val service = service()
+        service.ignoreDevice("emulator-5554")
+        service.ignoreDevice("R3CN30ABCDE")
+
+        service.rememberDevices(listOf(RememberedDevice("emulator-5554", "Pixel 7")))
+
+        // Connecting is an explicit opt-in, so the device is no longer ignored.
+        assertEquals(setOf("R3CN30ABCDE"), service.getIgnoredDeviceIds())
+    }
+
+    @Test
+    fun forgetDevice_removesOnlyThatDevice() {
+        val service = service()
+        service.rememberDevices(listOf(RememberedDevice("a", "A"), RememberedDevice("b", "B")))
+
+        service.forgetDevice("a")
+
+        assertEquals(listOf("b"), service.getRememberedDevices().map { it.id })
+        assertEquals(setOf("b"), service.getRememberedDeviceIds())
+    }
+
+    @Test
+    fun importLegacyState_carriesOverDisabledResetTime() {
+        val service = service()
+
+        service.importLegacyState(ProxyCommanderSettingsService.State(resetTimeOnConnect = false))
+
+        assertFalse(service.getConfig().resetTimeOnConnect)
     }
 
     @Test

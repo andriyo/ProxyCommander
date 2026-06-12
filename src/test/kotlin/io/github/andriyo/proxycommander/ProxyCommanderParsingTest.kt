@@ -113,4 +113,52 @@ class ProxyCommanderParsingTest {
         assertFalse(ProxyCommanderParsing.isEmulatorSerial("emulator-"))
         assertFalse(ProxyCommanderParsing.isEmulatorSerial("emulator-5554-extra"))
     }
+
+    @Test
+    fun looksLikeCmdFailure_detectsErrorMarkersOnly() {
+        assertTrue(ProxyCommanderParsing.looksLikeCmdFailure("Error: no such command"))
+        assertTrue(ProxyCommanderParsing.looksLikeCmdFailure("Unknown command: set_time_state_for_tests"))
+        assertTrue(ProxyCommanderParsing.looksLikeCmdFailure("usage: time_detector ..."))
+        assertTrue(ProxyCommanderParsing.looksLikeCmdFailure("java.lang.SecurityException: denied"))
+        assertFalse(ProxyCommanderParsing.looksLikeCmdFailure(""))
+        assertFalse(ProxyCommanderParsing.looksLikeCmdFailure("confirmed"))
+        assertFalse(ProxyCommanderParsing.looksLikeCmdFailure("TimeState: 2024-05-01T10:00:00Z"))
+    }
+
+    @Test
+    fun parseLsofListeningProcessName_returnsFirstListeningProcess() {
+        val output = """
+            COMMAND   PID   USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME
+            Charles 12345 andrii  123u  IPv6 0xabcdef      0t0  TCP *:8888 (LISTEN)
+        """.trimIndent()
+
+        assertEquals("Charles", ProxyCommanderParsing.parseLsofListeningProcessName(output))
+        assertNull(ProxyCommanderParsing.parseLsofListeningProcessName("COMMAND PID USER"))
+        assertNull(ProxyCommanderParsing.parseLsofListeningProcessName(""))
+    }
+
+    @Test
+    fun parseNetstatListeningPid_matchesPortAndListeningState() {
+        val output = """
+            Active Connections
+
+              Proto  Local Address          Foreign Address        State           PID
+              TCP    0.0.0.0:8888           0.0.0.0:0              LISTENING       4242
+              TCP    0.0.0.0:9999           0.0.0.0:0              LISTENING       1111
+              TCP    127.0.0.1:8888         127.0.0.1:51000        ESTABLISHED     4242
+        """.trimIndent()
+
+        assertEquals("4242", ProxyCommanderParsing.parseNetstatListeningPid(output, 8888))
+        assertEquals("1111", ProxyCommanderParsing.parseNetstatListeningPid(output, 9999))
+        assertNull(ProxyCommanderParsing.parseNetstatListeningPid(output, 7777))
+    }
+
+    @Test
+    fun parseTasklistProcessName_readsCsvImageName() {
+        val output = "\"Charles.exe\",\"4242\",\"Console\",\"1\",\"512,000 K\""
+
+        assertEquals("Charles.exe", ProxyCommanderParsing.parseTasklistProcessName(output))
+        assertNull(ProxyCommanderParsing.parseTasklistProcessName("INFO: No tasks are running."))
+        assertNull(ProxyCommanderParsing.parseTasklistProcessName(""))
+    }
 }

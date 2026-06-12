@@ -61,8 +61,8 @@ class ProxyCommanderConfigurable : SearchableConfigurable {
     override fun apply() {
         val port = portField.text.trim().toIntOrNull()
             ?: throw ConfigurationException("Port must be a number.")
-        if (port !in 1..65535) {
-            throw ConfigurationException("Port must be between 1 and 65535.")
+        if (port !in VALID_PORT_RANGE) {
+            throw ConfigurationException("Port must be between ${VALID_PORT_RANGE.first} and ${VALID_PORT_RANGE.last}.")
         }
 
         val adbPath = adbPathField.text.trim()

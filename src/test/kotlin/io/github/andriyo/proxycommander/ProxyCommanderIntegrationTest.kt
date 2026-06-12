@@ -155,8 +155,8 @@ class ProxyCommanderIntegrationTest {
         try {
             controller.disconnectAllDevices(logs::add)
             assertTrue(
-                controller.connectEmulatorAndClearProxyOnOthers(selectedSerial, logs::add),
-                "connectEmulatorAndClearProxyOnOthers failed.\n${logs.joinToString("\n")}"
+                controller.connectDeviceAndClearProxyOnOthers(selectedSerial, logs::add),
+                "connectDeviceAndClearProxyOnOthers failed.\n${logs.joinToString("\n")}"
             )
 
             assertTrue(hasReverseMapping(selectedSerial, proxyPort), "Selected device reverse mapping missing.")

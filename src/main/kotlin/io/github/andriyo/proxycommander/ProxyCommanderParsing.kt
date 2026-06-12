@@ -80,5 +80,47 @@ internal object ProxyCommanderParsing {
         return proxyCleared && hostCleared && portCleared && pacCleared
     }
 
+    /**
+     * `cmd <service>` often exits 0 even when it rejects the sub-command, so failures must also
+     * be detected from the output text.
+     */
+    fun looksLikeCmdFailure(output: String): Boolean {
+        val normalized = output.trim()
+        if (normalized.isEmpty()) {
+            return false
+        }
+        return CMD_FAILURE_MARKERS.any { normalized.contains(it, ignoreCase = true) }
+    }
+
+    /** First listening process name from `lsof -nP -iTCP:<port> -sTCP:LISTEN` output. */
+    fun parseLsofListeningProcessName(output: String): String? =
+        output.lineSequence()
+            .drop(1)
+            .map { it.trim() }
+            .firstOrNull { it.isNotEmpty() }
+            ?.split(WHITESPACE)
+            ?.firstOrNull()
+
+    /** PID of the process listening on [port] from `netstat -ano -p TCP` output. */
+    fun parseNetstatListeningPid(output: String, port: Int): String? =
+        output.lineSequence()
+            .map { it.trim().split(WHITESPACE) }
+            .filter { columns -> columns.size >= 5 && columns[0].equals("TCP", ignoreCase = true) }
+            .firstOrNull { columns ->
+                columns[1].endsWith(":$port") && columns[3].equals("LISTENING", ignoreCase = true)
+            }
+            ?.getOrNull(4)
+
+    /** Image name from `tasklist /FO CSV /NH` output (`"name","pid",...`). */
+    fun parseTasklistProcessName(output: String): String? =
+        output.lineSequence()
+            .map { it.trim() }
+            .firstOrNull { it.startsWith("\"") }
+            ?.removePrefix("\"")
+            ?.substringBefore("\"")
+            ?.takeIf { it.isNotBlank() }
+
     private val WHITESPACE = Regex("\\s+")
+
+    private val CMD_FAILURE_MARKERS = listOf("error", "unknown command", "exception", "usage:", "not found")
 }
