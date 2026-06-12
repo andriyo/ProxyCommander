@@ -8,18 +8,21 @@ import com.intellij.openapi.project.Project
 import com.intellij.openapi.ui.DialogWrapper
 import com.intellij.openapi.ui.Messages
 import com.intellij.openapi.util.IconLoader
+import com.intellij.openapi.util.text.StringUtil
+import com.intellij.ui.AnimatedIcon
+import com.intellij.ui.ColorUtil
+import com.intellij.ui.JBColor
 import com.intellij.ui.components.JBLabel
 import com.intellij.ui.components.JBScrollPane
 import com.intellij.util.ui.JBUI
+import com.intellij.util.ui.UIUtil
 import java.awt.BorderLayout
-import java.awt.Component
-import java.awt.Container
 import java.awt.Dimension
 import java.awt.FlowLayout
-import javax.swing.AbstractButton
+import javax.swing.BorderFactory
 import javax.swing.Action
-import javax.swing.Box
 import javax.swing.BoxLayout
+import javax.swing.Icon
 import javax.swing.JButton
 import javax.swing.JComponent
 import javax.swing.JPanel
@@ -49,14 +52,22 @@ private class DevicesDialog(
 ) : DialogWrapper(project) {
 
     private val devicesPanel = JPanel()
-    private val statusLabel = JBLabel("Loading devices...")
+    private val statusLabel = JBLabel()
+    private val loadingIcon = AnimatedIcon.Default()
     private val refreshButton = JButton("Refresh")
     private val connectAllButton = JButton("Proxy All", CONNECT_ALL_ICON)
     private val disconnectAllButton = JButton("Unproxy All", DISCONNECT_ALL_ICON)
 
+    /** Row buttons paired with the enabled state they should have while no operation runs. */
+    private val rowButtons = mutableListOf<Pair<JButton, Boolean>>()
+
     @Volatile
     private var busy = false
     private var lastSignaledKey: Pair<Set<String>, Set<String>>? = null
+    private var lastRenderedEntries: List<DeviceDialogEntry>? = null
+
+    /** Bumped on every reload (EDT-only); stale background reads are dropped on arrival. */
+    private var reloadGeneration = 0
 
     // Live-update: when the background watcher reports a change in connected devices or their
     // proxy state, refresh the list instead of forcing the user to click Refresh. Skipped while
@@ -92,6 +103,9 @@ private class DevicesDialog(
         super.dispose()
     }
 
+    /** Lets the IDE remember the dialog's size and position across openings. */
+    override fun getDimensionServiceKey(): String = "ProxyCommander.DevicesDialog"
+
     override fun createCenterPanel(): JComponent {
         val root = JPanel(BorderLayout(0, 8))
         root.preferredSize = Dimension(920, 420)
@@ -106,6 +120,7 @@ private class DevicesDialog(
 
         devicesPanel.layout = BoxLayout(devicesPanel, BoxLayout.Y_AXIS)
         devicesPanel.border = JBUI.Borders.empty(6)
+        devicesPanel.add(JBLabel("Loading devices..."))
         root.add(JBScrollPane(devicesPanel), BorderLayout.CENTER)
         root.add(statusLabel, BorderLayout.SOUTH)
         return root
@@ -113,8 +128,14 @@ private class DevicesDialog(
 
     override fun createActions(): Array<Action> = arrayOf(cancelAction)
 
+    /**
+     * Refreshes the list in place: the current rows stay visible (and clickable, unless an
+     * operation disabled them) while fresh data loads, and rows are only rebuilt when something
+     * actually changed — no flashing.
+     */
     private fun reloadDevices(statusOverride: String? = null) {
-        setLoadingState("Loading devices...")
+        val generation = ++reloadGeneration
+        showStatus(statusOverride ?: "Refreshing devices...", loading = true)
         ApplicationManager.getApplication().executeOnPooledThread {
             val remembered = settings.getRememberedDevices()
             val ignored = settings.getIgnoredDeviceIds()
@@ -129,17 +150,21 @@ private class DevicesDialog(
             val entries = buildEntries(remembered, ignored, connectedDevices)
             val status = statusOverride ?: when {
                 connectedDevices == null -> ProxyCommanderExecution.summarize(logs, "ADB command is not available.")
-                connectedDevices.isEmpty() && entries.isEmpty() -> "No devices available."
+                entries.isEmpty() -> "No devices available."
                 else -> "Available: ${connectedDevices.size}. Remembered: ${remembered.size}."
             }
 
             ApplicationManager.getApplication().invokeLater(
                 {
-                    renderDevices(entries)
-                    refreshButton.isEnabled = true
-                    connectAllButton.isEnabled = true
-                    disconnectAllButton.isEnabled = true
-                    statusLabel.text = status
+                    if (isDisposed || generation != reloadGeneration) {
+                        return@invokeLater // superseded by a newer reload
+                    }
+                    if (busy) {
+                        return@invokeLater // an operation started meanwhile; it reloads on completion
+                    }
+                    renderDevicesIfChanged(entries)
+                    setControlsEnabled(true)
+                    showStatus(status, loading = false)
                 },
                 ModalityState.any()
             )
@@ -194,23 +219,16 @@ private class DevicesDialog(
             )
     }
 
-    private fun setLoadingState(message: String) {
-        refreshButton.isEnabled = false
-        connectAllButton.isEnabled = false
-        disconnectAllButton.isEnabled = false
-        devicesPanel.removeAll()
-        devicesPanel.add(JBLabel(message))
-        devicesPanel.revalidate()
-        devicesPanel.repaint()
+    private fun showStatus(message: String, loading: Boolean) {
         statusLabel.text = message
+        statusLabel.icon = if (loading) loadingIcon else null
     }
 
-    private fun setOperationInProgress(message: String) {
-        refreshButton.isEnabled = false
-        connectAllButton.isEnabled = false
-        disconnectAllButton.isEnabled = false
-        setButtonsEnabled(devicesPanel, false)
-        statusLabel.text = message
+    private fun setControlsEnabled(enabled: Boolean) {
+        refreshButton.isEnabled = enabled
+        connectAllButton.isEnabled = enabled
+        disconnectAllButton.isEnabled = enabled
+        rowButtons.forEach { (button, enabledWhenIdle) -> button.isEnabled = enabled && enabledWhenIdle }
     }
 
     private fun connectAllDevices() {
@@ -323,7 +341,8 @@ private class DevicesDialog(
         operation: (ProxyCommanderController, (String) -> Unit) -> Boolean
     ) {
         busy = true
-        setOperationInProgress(busyMessage)
+        setControlsEnabled(false)
+        showStatus(busyMessage, loading = true)
         ProxyCommanderExecution.runControllerOperation(
             projectBasePath = project.basePath,
             config = settings.getConfig(),
@@ -348,13 +367,11 @@ private class DevicesDialog(
                         }
                     }
                     if (reloadAfter) {
+                        // Controls stay disabled until the reload lands, so no stale row can be clicked.
                         reloadDevices(message)
                     } else {
-                        setButtonsEnabled(devicesPanel, true)
-                        refreshButton.isEnabled = true
-                        connectAllButton.isEnabled = true
-                        disconnectAllButton.isEnabled = true
-                        statusLabel.text = message
+                        setControlsEnabled(true)
+                        showStatus(message, loading = false)
                     }
                 },
                 ModalityState.any()
@@ -362,90 +379,112 @@ private class DevicesDialog(
         }
     }
 
+    private fun renderDevicesIfChanged(entries: List<DeviceDialogEntry>) {
+        if (entries == lastRenderedEntries) {
+            return
+        }
+        lastRenderedEntries = entries
+        renderDevices(entries)
+    }
+
     private fun renderDevices(entries: List<DeviceDialogEntry>) {
         devicesPanel.removeAll()
+        rowButtons.clear()
         if (entries.isEmpty()) {
             devicesPanel.add(JBLabel("No devices found. Connect a device or use Proxy Commander actions first."))
         } else {
-            entries.forEach { entry ->
-                val row = JPanel(BorderLayout(8, 0))
-                row.border = JBUI.Borders.empty(4, 0)
-                row.alignmentX = 0f
-
-                val infoText = buildString {
-                    append("<html><b>")
-                    append(entry.name)
-                    append("</b> &nbsp; <code>")
-                    append("API ")
-                    append(entry.apiLevel)
-                    append("</code> &nbsp; <code>")
-                    append(entry.serial ?: "serial unavailable")
-                    append("</code>")
-                    append("<br/>Status: ")
-                    append(if (entry.connected) "Available" else "Unavailable")
-                    append(" | Proxy: ")
-                    append(if (entry.proxyConnected) "Connected" else "Not Connected")
-                    if (entry.remembered) {
-                        append(" | Auto-connect enabled")
-                    }
-                    if (entry.ignored) {
-                        append(" | Offers muted")
-                    }
-                    append("</html>")
-                }
-                row.add(JBLabel(infoText), BorderLayout.CENTER)
-
-                val actions = JPanel(FlowLayout(FlowLayout.RIGHT, 6, 0))
-                val connectButton = JButton("Proxy", CONNECT_SINGLE_ICON)
-                connectButton.toolTipText = "Enable reverse mapping + HTTP proxy and remember for auto-connect"
-                connectButton.isEnabled = entry.connected
-                connectButton.addActionListener { connectDevice(entry) }
-                actions.add(connectButton)
-
-                val connectOnlyButton = JButton("Only This", CONNECT_CURRENT_ICON)
-                connectOnlyButton.toolTipText = "Proxy this device and disconnect the proxy from every other device"
-                connectOnlyButton.isEnabled = entry.connected
-                connectOnlyButton.addActionListener { connectOnlyDevice(entry) }
-                actions.add(connectOnlyButton)
-
-                val unproxyButton = JButton("Unproxy", DISCONNECT_SINGLE_ICON)
-                unproxyButton.toolTipText = "Remove reverse mapping + HTTP proxy and disable auto-connect"
-                unproxyButton.isEnabled = entry.connected
-                unproxyButton.addActionListener { unproxyDevice(entry) }
-                actions.add(unproxyButton)
-
-                val testButton = JButton("Test", TEST_ICON)
-                testButton.toolTipText = "Verify device proxy, reverse mapping, and that a host proxy is listening"
-                testButton.isEnabled = entry.connected
-                testButton.addActionListener { testConnection(entry) }
-                actions.add(testButton)
-
-                val forgetButton = JButton("Forget", FORGET_ICON)
-                forgetButton.toolTipText = "Disable auto-connect for this device (keeps its current proxy state)"
-                forgetButton.isEnabled = entry.remembered
-                forgetButton.addActionListener { forgetDevice(entry) }
-                actions.add(forgetButton)
-
-                row.add(actions, BorderLayout.EAST)
-                row.maximumSize = Dimension(Int.MAX_VALUE, maxOf(row.preferredSize.height, 56))
-
-                devicesPanel.add(row)
-                devicesPanel.add(Box.createVerticalStrut(4))
+            entries.forEachIndexed { index, entry ->
+                devicesPanel.add(deviceRow(entry, isLast = index == entries.lastIndex))
             }
         }
         devicesPanel.revalidate()
         devicesPanel.repaint()
     }
 
-    private fun setButtonsEnabled(component: Component, enabled: Boolean) {
-        if (component is AbstractButton) {
-            component.isEnabled = enabled
+    private fun deviceRow(entry: DeviceDialogEntry, isLast: Boolean): JPanel {
+        val row = JPanel(BorderLayout(8, 0))
+        val padding = JBUI.Borders.empty(6, 2)
+        row.border = if (isLast) {
+            padding
+        } else {
+            BorderFactory.createCompoundBorder(JBUI.Borders.customLineBottom(JBColor.border()), padding)
         }
-        if (component is Container) {
-            component.components.forEach { child ->
-                setButtonsEnabled(child, enabled)
+        row.alignmentX = 0f
+        row.add(JBLabel(deviceInfoHtml(entry)), BorderLayout.CENTER)
+        row.add(deviceActions(entry), BorderLayout.EAST)
+        row.maximumSize = Dimension(Int.MAX_VALUE, maxOf(row.preferredSize.height, 56))
+        return row
+    }
+
+    private fun deviceInfoHtml(entry: DeviceDialogEntry): String {
+        val secondary = ColorUtil.toHtmlColor(UIUtil.getContextHelpForeground())
+        val (dot, dotColor, statusText) = when {
+            entry.proxyConnected -> Triple("●", ColorUtil.toHtmlColor(PROXIED_COLOR), "Proxied")
+            entry.connected -> Triple("○", secondary, "Not proxied")
+            else -> Triple("○", secondary, "Offline")
+        }
+        return buildString {
+            append("<html><b>").append(StringUtil.escapeXmlEntities(entry.name)).append("</b>")
+            append("&nbsp;&nbsp;<font color='").append(secondary).append("'>")
+            append("API ").append(entry.apiLevel)
+            append(" &middot; ").append(entry.serial ?: "offline")
+            append("</font><br/>")
+            append("<font color='").append(dotColor).append("'>").append(dot).append(' ').append(statusText).append("</font>")
+            if (entry.remembered) {
+                append("<font color='").append(secondary).append("'> &middot; Auto-connect</font>")
             }
+            if (entry.ignored) {
+                append("<font color='").append(secondary).append("'> &middot; Offers muted</font>")
+            }
+            append("</html>")
         }
+    }
+
+    private fun deviceActions(entry: DeviceDialogEntry): JPanel {
+        val actions = JPanel(FlowLayout(FlowLayout.RIGHT, 6, 0))
+        actions.isOpaque = false
+        addRowButton(
+            actions, "Proxy", CONNECT_SINGLE_ICON,
+            tooltip = "Enable reverse mapping + HTTP proxy and remember for auto-connect",
+            enabledWhenIdle = entry.connected
+        ) { connectDevice(entry) }
+        addRowButton(
+            actions, "Only This", CONNECT_CURRENT_ICON,
+            tooltip = "Proxy this device and disconnect the proxy from every other device",
+            enabledWhenIdle = entry.connected
+        ) { connectOnlyDevice(entry) }
+        addRowButton(
+            actions, "Unproxy", DISCONNECT_SINGLE_ICON,
+            tooltip = "Remove reverse mapping + HTTP proxy and disable auto-connect",
+            enabledWhenIdle = entry.connected
+        ) { unproxyDevice(entry) }
+        addRowButton(
+            actions, "Test", TEST_ICON,
+            tooltip = "Verify device proxy, reverse mapping, and that a host proxy is listening",
+            enabledWhenIdle = entry.connected
+        ) { testConnection(entry) }
+        addRowButton(
+            actions, "Forget", FORGET_ICON,
+            tooltip = "Disable auto-connect for this device (keeps its current proxy state)",
+            enabledWhenIdle = entry.remembered
+        ) { forgetDevice(entry) }
+        return actions
+    }
+
+    private fun addRowButton(
+        parent: JPanel,
+        text: String,
+        icon: Icon,
+        tooltip: String,
+        enabledWhenIdle: Boolean,
+        onClick: () -> Unit
+    ) {
+        val button = JButton(text, icon)
+        button.toolTipText = tooltip
+        button.isEnabled = enabledWhenIdle && !busy
+        button.addActionListener { onClick() }
+        rowButtons += button to enabledWhenIdle
+        parent.add(button)
     }
 
     private companion object {
@@ -456,5 +495,8 @@ private class DevicesDialog(
         val DISCONNECT_SINGLE_ICON = IconLoader.getIcon("/icons/proxy_disconnect_all.svg", DevicesDialog::class.java)
         val TEST_ICON = AllIcons.Actions.Help
         val FORGET_ICON = AllIcons.Actions.Cancel
+
+        /** Green that works on both light and dark themes. */
+        val PROXIED_COLOR = JBColor(0x2E7D32, 0x499C54)
     }
 }

@@ -50,6 +50,7 @@ intellijPlatform {
               <li>Better: changing the port now cleans up reverse mappings left over from the previous port on connect/disconnect.</li>
               <li>Better: the host-proxy connection test can name the listening process on <b>Windows</b> too (netstat/tasklist).</li>
               <li>Better: device details load in parallel, so the Devices dialog opens faster with many devices.</li>
+              <li>Better: the Devices dialog refreshes in place (no more list flashing), shows a colored proxy-state indicator per device, displays a subtle loading spinner in the status line, and remembers its size and position.</li>
               <li>Fixed: adb commands with large output (e.g. <code>getprop</code> on prop-heavy devices) no longer stall until the timeout.</li>
               <li>Fixed: the clock-reset step now reports honestly when <code>time_detector</code> is unsupported instead of claiming success.</li>
               <li>Fixed: migration from per-project settings now preserves a disabled "Reset device clock on connect".</li>
