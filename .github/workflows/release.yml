@@ -47,7 +47,7 @@ jobs:
         run: ./gradlew verifyPlugin verifyPluginProjectConfiguration verifyPluginStructure --no-parallel
 
       - name: Sign plugin
-        run: ./gradlew signPlugin verifyPluginSignature
+        run: ./gradlew verifyPluginSignature
         env:
           CERTIFICATE_CHAIN: ${{ secrets.CERTIFICATE_CHAIN }}
           PRIVATE_KEY: ${{ secrets.PRIVATE_KEY }}

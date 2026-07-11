@@ -138,6 +138,11 @@ tasks {
     test {
         useJUnitPlatform()
     }
+    named("verifyPluginSignature") {
+        // The verifier consumes the signed ZIP; make that producer/consumer relationship explicit
+        // for Gradle 9 task validation and let the release workflow invoke one ordered pipeline.
+        dependsOn("signPlugin")
+    }
 }
 
 kotlin {
