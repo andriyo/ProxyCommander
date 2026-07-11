@@ -46,10 +46,24 @@ jobs:
       - name: Verify plugin compatibility and project configuration
         run: ./gradlew verifyPlugin verifyPluginProjectConfiguration verifyPluginStructure --no-parallel
 
+      - name: Prepare signing certificate file
+        shell: bash
+        env:
+          CERTIFICATE_CHAIN: ${{ secrets.CERTIFICATE_CHAIN }}
+        run: |
+          set -euo pipefail
+          certificate_file="$RUNNER_TEMP/proxycommander-certificate-chain.pem"
+          if [[ "$CERTIFICATE_CHAIN" == *"BEGIN CERTIFICATE"* ]]; then
+            printf '%s' "$CERTIFICATE_CHAIN" > "$certificate_file"
+          else
+            printf '%s' "$CERTIFICATE_CHAIN" | base64 --decode > "$certificate_file"
+          fi
+          chmod 600 "$certificate_file"
+          echo "CERTIFICATE_CHAIN_FILE=$certificate_file" >> "$GITHUB_ENV"
+
       - name: Sign plugin
         run: ./gradlew verifyPluginSignature
         env:
-          CERTIFICATE_CHAIN: ${{ secrets.CERTIFICATE_CHAIN }}
           PRIVATE_KEY: ${{ secrets.PRIVATE_KEY }}
           PRIVATE_KEY_PASSWORD: ${{ secrets.PRIVATE_KEY_PASSWORD }}
 
@@ -57,6 +71,8 @@ jobs:
         run: ./gradlew publishPlugin
         env:
           PUBLISH_TOKEN: ${{ secrets.PUBLISH_TOKEN }}
+          PRIVATE_KEY: ${{ secrets.PRIVATE_KEY }}
+          PRIVATE_KEY_PASSWORD: ${{ secrets.PRIVATE_KEY_PASSWORD }}
           CERTIFICATE_CHAIN: ${{ secrets.CERTIFICATE_CHAIN }}
           PRIVATE_KEY: ${{ secrets.PRIVATE_KEY }}
           PRIVATE_KEY_PASSWORD: ${{ secrets.PRIVATE_KEY_PASSWORD }}
