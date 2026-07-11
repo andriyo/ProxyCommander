@@ -2,6 +2,7 @@ package io.github.andriyo.proxycommander
 
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.components.PersistentStateComponent
+import com.intellij.openapi.components.RoamingType
 import com.intellij.openapi.components.Service
 import com.intellij.openapi.components.State
 import com.intellij.openapi.components.Storage
@@ -14,7 +15,12 @@ internal data class RememberedDevice(
 internal val VALID_PORT_RANGE = 1..65535
 
 @Service(Service.Level.APP)
-@State(name = "ProxyCommanderSettings", storages = [Storage("proxyCommander.xml")])
+@State(
+    name = "ProxyCommanderSettings",
+    // ADB paths and device identifiers belong to this workstation and must not be copied to a
+    // different OS / SDK installation by Settings Sync.
+    storages = [Storage(value = "proxyCommander.xml", roamingType = RoamingType.DISABLED)]
+)
 class ProxyCommanderSettingsService : PersistentStateComponent<ProxyCommanderSettingsService.State> {
 
     data class RememberedDeviceState(

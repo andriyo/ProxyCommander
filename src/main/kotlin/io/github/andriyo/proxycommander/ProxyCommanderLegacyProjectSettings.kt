@@ -31,7 +31,8 @@ internal class ProxyCommanderLegacyProjectSettings :
         val hasData = current.rememberedDevices.isNotEmpty() ||
             current.rememberedDeviceIds.isNotEmpty() ||
             current.adbPath.isNotBlank() ||
-            current.port != ProxyCommanderSettingsService.DEFAULT_PORT
+            current.port != ProxyCommanderSettingsService.DEFAULT_PORT ||
+            !current.resetTimeOnConnect
         // Reset to defaults so the framework clears the legacy `.idea/proxyCommander.xml` entry on
         // the next save and we never re-import (which would resurrect devices removed app-wide).
         state = ProxyCommanderSettingsService.State()

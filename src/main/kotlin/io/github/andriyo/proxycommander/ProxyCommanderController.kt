@@ -35,6 +35,19 @@ internal data class ConnectedEmulator(
     val model: String
 )
 
+internal data class DeviceIsolationResult(
+    val selectedConnected: Boolean,
+    val cleanupSucceeded: Boolean
+) {
+    val success: Boolean
+        get() = selectedConnected && cleanupSucceeded
+}
+
+private data class DeviceDisconnectResult(
+    val cleanupSucceeded: Boolean,
+    val internetVerified: Boolean?
+)
+
 internal class ProxyCommanderController internal constructor(
     private val adbClient: AdbCommander,
     private val config: ProxyCommanderConfig
@@ -52,24 +65,37 @@ internal class ProxyCommanderController internal constructor(
     private val reverseToken = "tcp:${config.port}"
     private val desiredProxy = "localhost:${config.port}"
 
+    private enum class ReverseEnableStatus {
+        ALREADY_ENABLED,
+        NEWLY_ENABLED,
+        FAILED
+    }
+
     fun ensureAdbAvailable(log: (String) -> Unit): Boolean {
         val result = adbClient.checkAvailability()
-        if (result.isCommandUnavailable) {
-            log("[ProxyCommander] ${result.briefOutput()}")
+        if (!result.success) {
+            log("[ProxyCommander] ADB availability check failed (exit ${result.exitCode}): ${result.briefOutput()}")
             return false
         }
         return true
     }
 
     fun listConnectedDevices(log: (String) -> Unit = {}): List<ConnectedDevice> {
+        return queryConnectedDevices(log).devices
+    }
+
+    private fun queryConnectedDevices(log: (String) -> Unit): ConnectedDeviceQuery {
         startAdbServer()
         val result = adbClient.run(args = listOf("devices"), allowFailure = true)
         if (!result.success) {
             log("[ProxyCommander] Failed to list connected devices: ${result.briefOutput()}")
-            return emptyList()
+            return ConnectedDeviceQuery(success = false, devices = emptyList())
         }
 
-        return ProxyCommanderParsing.parseDevices(result.output)
+        return ConnectedDeviceQuery(
+            success = true,
+            devices = ProxyCommanderParsing.parseDevices(result.output)
+        )
     }
 
     fun listConnectedEmulators(log: (String) -> Unit = {}): List<ConnectedEmulator> {
@@ -162,106 +188,150 @@ internal class ProxyCommanderController internal constructor(
         return connectSerial(serial, log)
     }
 
-    fun disconnectDevice(serial: String, log: (String) -> Unit): Boolean {
+    fun disconnectDevice(serial: String, log: (String) -> Unit): Boolean =
+        disconnectDevice(serial, verifyInternet = true, log = log)
+
+    fun disconnectDevice(
+        serial: String,
+        verifyInternet: Boolean,
+        log: (String) -> Unit
+    ): Boolean {
         val exists = listConnectedDevices(log).any { it.serial == serial }
         if (!exists) {
             log("[ProxyCommander] Device '$serial' is not connected.")
             return false
         }
-        return disconnectSerial(serial, log)
+        return disconnectSerial(serial, log, verifyInternet).cleanupSucceeded
     }
 
     fun disconnectAllDevices(log: (String) -> Unit): Boolean {
-        val devices = listConnectedDevices(log)
-        if (devices.isEmpty()) {
-            log("[ProxyCommander] No connected devices in 'device' state.")
+        val query = queryConnectedDevices(log)
+        if (!query.success) {
             return false
+        }
+
+        val devices = query.devices
+        if (devices.isEmpty()) {
+            log("[ProxyCommander] No connected devices to disconnect.")
+            return true
         }
 
         log("[ProxyCommander] Disconnecting ${devices.size} device(s) on $reverseToken")
         var failed = false
+        val internetUnverified = mutableListOf<String>()
         devices.forEach { device ->
-            if (!disconnectSerial(device.serial, log)) {
+            val result = disconnectSerial(device.serial, log)
+            if (!result.cleanupSucceeded) {
                 failed = true
+            } else if (result.internetVerified == false) {
+                internetUnverified += device.serial
             }
         }
 
         if (failed) {
             log("[ProxyCommander] Disconnect finished with errors on one or more devices.")
+        } else if (internetUnverified.isNotEmpty()) {
+            log("[ProxyCommander] Disconnect completed, but direct internet access could not be verified for: ${internetUnverified.joinToString()}.")
         } else {
-            log("[ProxyCommander] Disconnect completed successfully for all devices.")
+            log("[ProxyCommander] Disconnect completed successfully and direct internet access was verified for all devices.")
         }
         return !failed
     }
 
-    fun keepOnlyDevice(selectedSerial: String, log: (String) -> Unit): Boolean {
+    fun keepOnlyDevice(selectedSerial: String, log: (String) -> Unit): Boolean =
+        keepOnlyDeviceWithOutcome(selectedSerial, log).success
+
+    fun keepOnlyDeviceWithOutcome(selectedSerial: String, log: (String) -> Unit): DeviceIsolationResult {
         val devices = listConnectedDevices(log)
         if (devices.isEmpty()) {
             log("[ProxyCommander] No connected devices in 'device' state.")
-            return false
+            return DeviceIsolationResult(selectedConnected = false, cleanupSucceeded = false)
         }
         if (devices.none { it.serial == selectedSerial }) {
             log("[ProxyCommander] Selected device '$selectedSerial' is not connected.")
-            return false
+            return DeviceIsolationResult(selectedConnected = false, cleanupSucceeded = false)
         }
 
         if (!connectSerial(selectedSerial, log)) {
             log("[ProxyCommander] Failed to keep selected device '$selectedSerial' connected.")
-            return false
+            return DeviceIsolationResult(selectedConnected = false, cleanupSucceeded = false)
         }
 
         val others = devices.filterNot { it.serial == selectedSerial }
         if (others.isEmpty()) {
             log("[ProxyCommander] Selected device '$selectedSerial' is the only connected device.")
-            return true
+            return DeviceIsolationResult(selectedConnected = true, cleanupSucceeded = true)
         }
 
         var failed = false
+        val internetUnverified = mutableListOf<String>()
         others.forEach { device ->
-            if (!disconnectSerial(device.serial, log)) {
+            val result = disconnectSerial(device.serial, log)
+            if (!result.cleanupSucceeded) {
                 failed = true
+            } else if (result.internetVerified == false) {
+                internetUnverified += device.serial
             }
         }
-        return !failed
+        when {
+            failed -> log("[ProxyCommander] Selected device connected, but one or more other devices could not be fully disconnected.")
+            internetUnverified.isNotEmpty() ->
+                log("[ProxyCommander] Selected device connected and other devices were unproxied, but direct internet access could not be verified for: ${internetUnverified.joinToString()}.")
+            else ->
+                log("[ProxyCommander] Selected device connected; other devices were unproxied and their direct internet access was verified.")
+        }
+        return DeviceIsolationResult(selectedConnected = true, cleanupSucceeded = !failed)
     }
 
-    fun connectDeviceAndClearProxyOnOthers(activeSerial: String, log: (String) -> Unit): Boolean {
+    fun connectDeviceAndClearProxyOnOthers(activeSerial: String, log: (String) -> Unit): Boolean =
+        connectDeviceAndClearProxyOnOthersWithOutcome(activeSerial, log).success
+
+    fun connectDeviceAndClearProxyOnOthersWithOutcome(
+        activeSerial: String,
+        log: (String) -> Unit
+    ): DeviceIsolationResult {
         val devices = listConnectedDevices(log)
         if (devices.isEmpty()) {
             log("[ProxyCommander] No connected devices in 'device' state.")
-            return false
+            return DeviceIsolationResult(selectedConnected = false, cleanupSucceeded = false)
         }
 
         val activeDevice = devices.firstOrNull { it.serial == activeSerial }
         if (activeDevice == null) {
             log("[ProxyCommander] Active device '$activeSerial' is not connected.")
-            return false
+            return DeviceIsolationResult(selectedConnected = false, cleanupSucceeded = false)
         }
 
-        var failed = false
         if (!connectSerial(activeSerial, log)) {
-            failed = true
+            log("[ProxyCommander] Active device '$activeSerial' could not be connected; proxies on other devices were left unchanged.")
+            return DeviceIsolationResult(selectedConnected = false, cleanupSucceeded = false)
         }
 
         val others = devices.filterNot { it.serial == activeSerial }
         if (others.isEmpty()) {
             log("[ProxyCommander] Active device '$activeSerial' is the only connected device.")
-            return !failed
+            return DeviceIsolationResult(selectedConnected = true, cleanupSucceeded = true)
         }
 
+        var failed = false
+        val internetUnverified = mutableListOf<String>()
         log("[ProxyCommander] Clearing proxy on ${others.size} other connected device(s).")
         others.forEach { device ->
             if (!clearDeviceProxy(device.serial, log)) {
                 failed = true
+            } else if (!verifyDirectInternetAccess(device.serial, log)) {
+                internetUnverified += device.serial
             }
         }
 
         if (failed) {
             log("[ProxyCommander] Finished with errors while connecting active device and clearing proxies on others.")
+        } else if (internetUnverified.isNotEmpty()) {
+            log("[ProxyCommander] Active device connected and other proxies were cleared, but direct internet access could not be verified for: ${internetUnverified.joinToString()}.")
         } else {
-            log("[ProxyCommander] Active device connected and proxies cleared on all other connected devices.")
+            log("[ProxyCommander] Active device connected; other proxies were cleared and their direct internet access was verified.")
         }
-        return !failed
+        return DeviceIsolationResult(selectedConnected = true, cleanupSucceeded = !failed)
     }
 
     fun testProxyConnection(serial: String, log: (String) -> Unit): Boolean {
@@ -330,13 +400,32 @@ internal class ProxyCommanderController internal constructor(
     }
 
     private fun connectSerial(serial: String, log: (String) -> Unit): Boolean {
+        val previousProxy = readDeviceProxySnapshot(serial, log) ?: return false
+
         removeStaleReverseMappings(serial, log)
-        val reverseEnabled = enableReverse(serial, log)
-        val proxyConfigured = setDeviceProxy(serial, log)
+        val reverseStatus = enableReverse(serial, log)
+        if (reverseStatus == ReverseEnableStatus.FAILED) {
+            return false
+        }
+
+        if (!setDeviceProxy(serial, previousProxy.httpProxy, log)) {
+            if (!restoreDeviceProxy(serial, previousProxy, log)) {
+                log("[ProxyCommander] Failed to restore the previous proxy for $serial after proxy setup failed.")
+            }
+            if (reverseStatus == ReverseEnableStatus.NEWLY_ENABLED) {
+                if (removeReverse(serial, log)) {
+                    log("[ProxyCommander] Rolled back newly enabled reverse mapping for $serial after proxy setup failed.")
+                } else {
+                    log("[ProxyCommander] Failed to roll back newly enabled reverse mapping for $serial after proxy setup failed.")
+                }
+            }
+            return false
+        }
+
         if (config.resetTimeOnConnect) {
             resetDeviceTime(serial, log)
         }
-        return reverseEnabled && proxyConfigured
+        return true
     }
 
     private fun resetDeviceTime(serial: String, log: (String) -> Unit) {
@@ -377,16 +466,29 @@ internal class ProxyCommanderController internal constructor(
                 listOf("--user_should_confirm_time", "false"),
             allowFailure = true
         )
+        val setApplied = setResult.success && !ProxyCommanderParsing.looksLikeCmdFailure(setResult.output)
+        if (!setApplied) {
+            log("[ProxyCommander] Could not force clock on $serial via time_detector (not supported on this Android version?): ${setResult.briefOutput()}")
+            return
+        }
+
         val confirmResult = adbClient.run(
             serial,
             listOf("shell", "cmd", "time_detector", "confirm_time") + reference,
             allowFailure = true
         )
 
-        val setApplied = setResult.success && !ProxyCommanderParsing.looksLikeCmdFailure(setResult.output)
-        val confirmApplied = confirmResult.success && !ProxyCommanderParsing.looksLikeCmdFailure(confirmResult.output)
-        if (!setApplied && !confirmApplied) {
-            log("[ProxyCommander] Could not force clock on $serial via time_detector (not supported on this Android version?): ${setResult.briefOutput()}")
+        // `confirm_time` always exits zero on supported Android versions and prints the actual
+        // boolean result. Requiring an explicit `true` also verifies that the clock set above
+        // landed within Android's confidence threshold of the host reference.
+        val timeConfirmed = confirmResult.success &&
+            !ProxyCommanderParsing.looksLikeCmdFailure(confirmResult.output) &&
+            confirmResult.output.lineSequence()
+                .map { it.trim() }
+                .firstOrNull { it.isNotEmpty() }
+                ?.equals("true", ignoreCase = true) == true
+        if (!timeConfirmed) {
+            log("[ProxyCommander] Clock set command completed for $serial, but confirm_time did not verify the host time: ${confirmResult.briefOutput()}")
             return
         }
 
@@ -401,61 +503,150 @@ internal class ProxyCommanderController internal constructor(
 
     private fun parseUptimeMillis(output: String): Long? = ProxyCommanderParsing.parseUptimeMillis(output)
 
-    private fun disconnectSerial(serial: String, log: (String) -> Unit): Boolean {
+    private fun disconnectSerial(
+        serial: String,
+        log: (String) -> Unit,
+        verifyInternet: Boolean = true
+    ): DeviceDisconnectResult {
         val reverseRemoved = removeReverse(serial, log)
-        removeStaleReverseMappings(serial, log)
+        val staleReverseMappingsRemoved = removeStaleReverseMappings(serial, log)
         val proxyCleared = clearDeviceProxy(serial, log)
-        return reverseRemoved && proxyCleared
+        val internetVerified = if (proxyCleared && verifyInternet) verifyDirectInternetAccess(serial, log) else null
+        return DeviceDisconnectResult(
+            cleanupSucceeded = reverseRemoved && staleReverseMappingsRemoved && proxyCleared,
+            internetVerified = internetVerified
+        )
     }
 
-    private fun enableReverse(serial: String, log: (String) -> Unit): Boolean {
+    private fun verifyDirectInternetAccess(serial: String, log: (String) -> Unit): Boolean {
+        val result = adbClient.run(
+            serial,
+            listOf("shell", "sh", "-c", ProxyCommanderInternetProbe.shellScript()),
+            allowFailure = true,
+            timeoutMs = ProxyCommanderInternetProbe.COMMAND_TIMEOUT_MS
+        )
+        val success = result.takeIf { it.success }
+            ?.let { ProxyCommanderInternetProbe.parseSuccess(it.output) }
+        if (success != null) {
+            log("[ProxyCommander] Verified direct internet access for $serial via ${success.host} (${success.statusLine}).")
+            return true
+        }
+
+        val reason = when {
+            result.output.contains(ProxyCommanderInternetProbe.UNAVAILABLE_MARKER) ->
+                "the device does not provide the nc command"
+            result.exitCode == -2 -> "the HTTP probe timed out"
+            result.success -> "the probe did not return a valid HTTP status line"
+            else -> "no probe host returned a valid HTTP response"
+        }
+        log("[ProxyCommander] Proxy settings are cleared for $serial, but direct internet access could not be verified: $reason.")
+        return false
+    }
+
+    private fun enableReverse(serial: String, log: (String) -> Unit): ReverseEnableStatus {
         val reverseListResult = adbClient.run(serial, listOf("reverse", "--list"), allowFailure = true)
+        if (!reverseListResult.success) {
+            log("[ProxyCommander] Failed to inspect reverse mappings for $serial: ${reverseListResult.briefOutput()}")
+            return ReverseEnableStatus.FAILED
+        }
         if (containsReverseMapping(reverseListResult.output)) {
             log("[ProxyCommander] Reverse already enabled for $serial on $reverseToken")
-            return true
+            return ReverseEnableStatus.ALREADY_ENABLED
         }
 
         val enableResult = adbClient.run(serial, listOf("reverse", reverseToken, reverseToken), allowFailure = true)
         if (!enableResult.success) {
             log("[ProxyCommander] Failed to enable reverse for $serial: ${enableResult.briefOutput()}")
-            return false
+            return ReverseEnableStatus.FAILED
+        }
+
+        val verificationResult = adbClient.run(serial, listOf("reverse", "--list"), allowFailure = true)
+        if (!verificationResult.success) {
+            log("[ProxyCommander] Could not verify reverse mapping $reverseToken was enabled for $serial: ${verificationResult.briefOutput()}")
+            if (!removeReverse(serial, log)) {
+                log("[ProxyCommander] Failed to roll back unverified reverse mapping for $serial")
+            }
+            return ReverseEnableStatus.FAILED
+        }
+        if (!containsReverseMapping(verificationResult.output)) {
+            log("[ProxyCommander] Failed to enable reverse for $serial: mapping $reverseToken is not present after adb reported success")
+            return ReverseEnableStatus.FAILED
         }
 
         log("[ProxyCommander] Enabled reverse $reverseToken <-> $reverseToken for $serial")
-        return true
+        return ReverseEnableStatus.NEWLY_ENABLED
     }
 
     private fun removeReverse(serial: String, log: (String) -> Unit): Boolean {
-        adbClient.run(serial, listOf("reverse", "--remove", reverseToken), allowFailure = true)
-        log("[ProxyCommander] Reverse removal attempted for $serial on $reverseToken")
-        return true
+        return removeReverseMapping(serial, reverseToken, stale = false, log = log)
     }
 
     // Reverse mappings applied before a port change would otherwise linger on the device forever:
     // a later connect/disconnect only ever touches the current port's token.
-    private fun removeStaleReverseMappings(serial: String, log: (String) -> Unit) {
+    private fun removeStaleReverseMappings(serial: String, log: (String) -> Unit): Boolean {
         val staleTokens = config.previousPorts
             .filter { it != config.port }
             .map { "tcp:$it" }
         if (staleTokens.isEmpty()) {
-            return
+            return true
         }
 
         val listResult = adbClient.run(serial, listOf("reverse", "--list"), allowFailure = true)
         if (!listResult.success) {
-            return
+            log("[ProxyCommander] Failed to inspect stale reverse mappings for $serial: ${listResult.briefOutput()}")
+            return false
         }
 
+        var allRemoved = true
         staleTokens
             .filter { ProxyCommanderParsing.containsReverseMapping(listResult.output, it) }
             .forEach { token ->
-                adbClient.run(serial, listOf("reverse", "--remove", token), allowFailure = true)
-                log("[ProxyCommander] Removed stale reverse mapping $token for $serial (left over from a previous port)")
+                if (!removeReverseMapping(serial, token, stale = true, log = log)) {
+                    allRemoved = false
+                }
             }
+        return allRemoved
     }
 
-    private fun setDeviceProxy(serial: String, log: (String) -> Unit): Boolean {
-        val currentProxy = readGlobalSetting(serial, "http_proxy")
+    private fun removeReverseMapping(
+        serial: String,
+        token: String,
+        stale: Boolean,
+        log: (String) -> Unit
+    ): Boolean {
+        val beforeResult = adbClient.run(serial, listOf("reverse", "--list"), allowFailure = true)
+        if (beforeResult.success && !ProxyCommanderParsing.containsReverseMapping(beforeResult.output, token)) {
+            log("[ProxyCommander] Reverse mapping $token is already absent for $serial")
+            return true
+        }
+
+        val removeResult = adbClient.run(serial, listOf("reverse", "--remove", token), allowFailure = true)
+        val verificationResult = adbClient.run(serial, listOf("reverse", "--list"), allowFailure = true)
+        val mappingAbsent = verificationResult.success &&
+            !ProxyCommanderParsing.containsReverseMapping(verificationResult.output, token)
+        if (mappingAbsent) {
+            if (!removeResult.success) {
+                log("[ProxyCommander] Reverse mapping $token is absent for $serial after a failed removal attempt")
+            } else if (stale) {
+                log("[ProxyCommander] Removed stale reverse mapping $token for $serial (left over from a previous port)")
+            } else {
+                log("[ProxyCommander] Removed reverse mapping $token for $serial")
+            }
+            return true
+        }
+
+        when {
+            !removeResult.success ->
+                log("[ProxyCommander] Failed to remove reverse mapping $token for $serial: ${removeResult.briefOutput()}")
+            !verificationResult.success ->
+                log("[ProxyCommander] Could not verify reverse mapping $token was removed for $serial: ${verificationResult.briefOutput()}")
+            else ->
+                log("[ProxyCommander] Failed to remove reverse mapping $token for $serial: mapping is still present")
+        }
+        return false
+    }
+
+    private fun setDeviceProxy(serial: String, currentProxy: String, log: (String) -> Unit): Boolean {
         if (currentProxy == desiredProxy) {
             log("[ProxyCommander] Device proxy already set to $desiredProxy for $serial")
             return true
@@ -478,6 +669,41 @@ internal class ProxyCommanderController internal constructor(
         }
 
         log("[ProxyCommander] Device proxy set to $desiredProxy for $serial")
+        return true
+    }
+
+    private fun restoreDeviceProxy(
+        serial: String,
+        previousProxy: DeviceProxySnapshot,
+        log: (String) -> Unit
+    ): Boolean {
+        var commandsSucceeded = true
+        PROXY_SETTING_KEYS.forEach { key ->
+            val value = previousProxy[key]
+            val command = if (isAbsentSetting(value)) {
+                listOf("shell", "settings", "delete", "global", key)
+            } else {
+                listOf("shell", "settings", "put", "global", key, value)
+            }
+            val result = adbClient.run(serial, command, allowFailure = true)
+            if (!result.success) {
+                commandsSucceeded = false
+                log("[ProxyCommander] Could not restore proxy setting '$key' for $serial: ${result.briefOutput()}")
+            }
+        }
+
+        val restored = readDeviceProxySnapshot(serial, log) ?: return false
+        val verified = PROXY_SETTING_KEYS.all { key ->
+            proxySettingValuesEquivalent(key, previousProxy[key], restored[key])
+        }
+        if (!commandsSucceeded || !verified) {
+            if (!verified) {
+                log("[ProxyCommander] Proxy rollback verification failed for $serial.")
+            }
+            return false
+        }
+
+        log("[ProxyCommander] Restored the previous proxy configuration for $serial after proxy setup failed.")
         return true
     }
 
@@ -513,14 +739,58 @@ internal class ProxyCommanderController internal constructor(
     }
 
     private fun readGlobalSetting(serial: String, key: String): String {
+        return readGlobalSettingResult(serial, key).value
+    }
+
+    private fun readGlobalSettingResult(serial: String, key: String): GlobalSettingRead {
         val result = adbClient.run(serial, listOf("shell", "settings", "get", "global", key), allowFailure = true)
-        return result.output
+        val value = result.output
             .lineSequence()
             .firstOrNull()
             .orEmpty()
             .replace("\r", "")
             .trim()
+        return GlobalSettingRead(result = result, value = value)
     }
+
+    private fun readDeviceProxySnapshot(
+        serial: String,
+        log: (String) -> Unit
+    ): DeviceProxySnapshot? {
+        val result = adbClient.run(
+            serial,
+            listOf("shell", "settings", "list", "global"),
+            allowFailure = true
+        )
+        if (!result.success) {
+            log("[ProxyCommander] Failed to read the existing proxy configuration for $serial: ${result.briefOutput()}")
+            return null
+        }
+
+        val globalSettings = result.output.lineSequence()
+            .mapNotNull { line ->
+                val separator = line.indexOf('=')
+                if (separator <= 0) null else line.substring(0, separator) to line.substring(separator + 1)
+            }
+            .toMap()
+        val values = PROXY_SETTING_KEYS.associateWith { key -> globalSettings[key]?.trim() ?: "null" }
+        return DeviceProxySnapshot(values)
+    }
+
+    private fun proxySettingValuesEquivalent(key: String, expected: String, actual: String): Boolean {
+        if (expected == actual) {
+            return true
+        }
+        return when (key) {
+            "http_proxy" -> ProxyCommanderParsing.isProxyCleared(expected, "", "", "") &&
+                ProxyCommanderParsing.isProxyCleared(actual, "", "", "")
+            "global_http_proxy_port" ->
+                expected in CLEARED_PROXY_PORT_VALUES && actual in CLEARED_PROXY_PORT_VALUES
+            else -> isAbsentSetting(expected) && isAbsentSetting(actual)
+        }
+    }
+
+    private fun isAbsentSetting(value: String): Boolean = value.isBlank() || value == "null"
 
     private fun isProxyConnected(serial: String): Boolean {
         val currentProxy = readGlobalSetting(serial, "http_proxy")
@@ -680,6 +950,23 @@ internal class ProxyCommanderController internal constructor(
         adbClient.run(args = listOf("start-server"), allowFailure = true)
     }
 
+    private data class ConnectedDeviceQuery(
+        val success: Boolean,
+        val devices: List<ConnectedDevice>
+    )
+
+    private data class GlobalSettingRead(
+        val result: AdbCommandResult,
+        val value: String
+    )
+
+    private data class DeviceProxySnapshot(private val values: Map<String, String>) {
+        val httpProxy: String
+            get() = values.getValue("http_proxy")
+
+        operator fun get(key: String): String = values.getValue(key)
+    }
+
     private class DeviceProps(private val map: Map<String, String>) {
         // getprop renders an unset property as an empty value; treat blank and "null" as absent.
         fun get(key: String): String =
@@ -690,6 +977,15 @@ internal class ProxyCommanderController internal constructor(
         const val MAX_PROXY_PROBE_RESPONSE_CHARS = 8_192
         const val MAX_DETAIL_READ_THREADS = 4
         const val HOST_COMMAND_TIMEOUT_MS = 2_000L
+
+        val PROXY_SETTING_KEYS = listOf(
+            "http_proxy",
+            "global_http_proxy_host",
+            "global_http_proxy_port",
+            "global_http_proxy_exclusion_list",
+            "global_http_proxy_pac"
+        )
+        val CLEARED_PROXY_PORT_VALUES = setOf("", "null", "0", "-1")
 
         // (substring to match in the listening process name) -> (display name)
         val KNOWN_PROXY_PROCESSES = listOf(

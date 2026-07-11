@@ -220,7 +220,7 @@ class ProxyCommanderIntegrationTest {
     }
 
     private fun canReachAnyInternetHost(serial: String): Boolean =
-        INTERNET_HOSTS.any { host -> canDeviceAccessHttp(serial, host, 80) }
+        canDeviceAccessHttp(serial, ProxyCommanderInternetProbe.internetHosts, 80)
 
     private fun hasNc(serial: String): Boolean {
         val result = runAdb(
@@ -236,16 +236,20 @@ class ProxyCommanderIntegrationTest {
     }
 
     private fun canDeviceAccessHttp(serial: String, host: String, port: Int): Boolean {
+        return canDeviceAccessHttp(serial, listOf(host), port)
+    }
+
+    private fun canDeviceAccessHttp(serial: String, hosts: List<String>, port: Int): Boolean {
         val result = runAdb(
             serial = serial,
             args = listOf(
                 "shell",
                 "sh",
                 "-c",
-                "printf 'GET / HTTP/1.0\\r\\nHost: $host\\r\\nConnection: close\\r\\n\\r\\n' | nc -q 2 $host $port >/dev/null"
+                ProxyCommanderInternetProbe.shellScript(hosts, port)
             )
         )
-        return result.exitCode == 0
+        return result.exitCode == 0 && ProxyCommanderInternetProbe.parseSuccess(result.output) != null
     }
 
     private fun hasReverseMapping(serial: String, port: Int): Boolean {
@@ -367,6 +371,5 @@ class ProxyCommanderIntegrationTest {
         private const val DEFAULT_PROXY_PORT = 8080
         private const val COMMAND_TIMEOUT_MS = 12_000L
         private val ADB_BIN = System.getenv("ADB").takeUnless { it.isNullOrBlank() } ?: "adb"
-        private val INTERNET_HOSTS = listOf("example.com", "google.com", "cloudflare.com")
     }
 }

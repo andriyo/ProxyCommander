@@ -110,7 +110,6 @@ private class ProxyCommanderStatusBarWidget(private val project: Project) :
             "ProxyCommander.KeepSelectedDeviceAction",
             null,
             "ProxyCommander.ConnectAllDevicesAction",
-            "ProxyCommander.ConnectActiveEmulatorClearOthersProxyAction",
             "ProxyCommander.DisconnectAllDevicesAction",
             null,
             "ProxyCommander.SettingsAction"

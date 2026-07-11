@@ -74,6 +74,9 @@ class ProxyCommanderConfigurable : SearchableConfigurable {
             if (!adbFile.isFile) {
                 throw ConfigurationException("ADB path must point to the adb executable file.")
             }
+            if (!isWindowsHost() && !adbFile.canExecute()) {
+                throw ConfigurationException("ADB path is not executable.")
+            }
         }
 
         settings.updateConfig(port = port, adbPath = adbPath, resetTimeOnConnect = resetTimeCheckbox.isSelected)

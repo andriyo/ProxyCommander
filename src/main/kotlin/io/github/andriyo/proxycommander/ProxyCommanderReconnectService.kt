@@ -8,25 +8,168 @@ import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.components.Service
 import com.intellij.openapi.project.ProjectManager
 import com.intellij.util.concurrency.AppExecutorUtil
-import java.util.Collections
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
+
+internal data class ReconnectSnapshotWork(
+    val generation: Int,
+    val serials: Set<String>
+)
+
+internal data class ReconnectAutoConnectWork(
+    val generation: Int,
+    val serial: String,
+    val config: ProxyCommanderConfig
+)
+
+/**
+ * Keeps reconnect work associated with the generation that produced it.
+ *
+ * Snapshot publication is serialized with generation changes, so an old callback can never update
+ * the connected-count cache, notify listeners, or replace pending work after a new generation has
+ * started. Workers take the generation from the pending value rather than from the runnable that
+ * happens to drain it. Auto-connect suppression is generation/config-aware so replacement work is
+ * not blocked by an obsolete attempt for the same serial.
+ */
+internal class ReconnectWorkState {
+    private val disposed = AtomicBoolean(false)
+    private val generation = AtomicInteger(0)
+    private val snapshotPublicationLock = Any()
+    private val latestSnapshot = AtomicReference<ReconnectSnapshotWork?>(null)
+    private val pendingSnapshot = AtomicReference<ReconnectSnapshotWork?>(null)
+    private val autoConnectInFlight = ConcurrentHashMap.newKeySet<ReconnectAutoConnectWork>()
+
+    fun beginGeneration(): Int? = synchronized(snapshotPublicationLock) {
+        if (disposed.get()) {
+            null
+        } else {
+            generation.incrementAndGet()
+        }
+    }
+
+    fun isCurrent(token: Int): Boolean =
+        !disposed.get() && generation.get() == token
+
+    fun isDisposed(): Boolean = disposed.get()
+
+    fun publishSnapshot(
+        token: Int,
+        serials: Set<String>,
+        onPublished: (Set<String>) -> Unit = {}
+    ): Boolean = synchronized(snapshotPublicationLock) {
+        if (!isCurrent(token)) {
+            return@synchronized false
+        }
+        val published = ReconnectSnapshotWork(token, serials.toSet())
+        latestSnapshot.set(published)
+        pendingSnapshot.set(published)
+        // Keep delivery in the same critical section. Otherwise an old publisher could pause after
+        // committing, let a newer generation publish/deliver, then resume and deliver stale counts.
+        onPublished(published.serials)
+        true
+    }
+
+    fun latestSnapshotSerials(): Set<String> = latestSnapshot.get()?.serials.orEmpty()
+
+    fun deliverLatestSnapshot(onDelivery: (Set<String>) -> Unit): Boolean =
+        synchronized(snapshotPublicationLock) {
+            if (disposed.get()) {
+                return@synchronized false
+            }
+            onDelivery(latestSnapshot.get()?.serials.orEmpty())
+            true
+        }
+
+    fun takeLatestSnapshot(): ReconnectSnapshotWork? = pendingSnapshot.getAndSet(null)
+
+    fun tryStartAutoConnect(work: ReconnectAutoConnectWork): Boolean =
+        isCurrent(work.generation) && autoConnectInFlight.add(work)
+
+    fun finishAutoConnect(work: ReconnectAutoConnectWork) {
+        autoConnectInFlight.remove(work)
+    }
+
+    fun dispose(): Boolean = synchronized(snapshotPublicationLock) {
+        if (!disposed.compareAndSet(false, true)) {
+            return@synchronized false
+        }
+        generation.incrementAndGet()
+        pendingSnapshot.set(null)
+        autoConnectInFlight.clear()
+        true
+    }
+}
+
+/** Thread-safe proxy-status state shared by snapshot and auto-connect workers. */
+internal class ProxiedSerialState {
+    private data class State(val revision: Long, val serials: Set<String>)
+
+    private val nextRevision = AtomicLong(0)
+    private val state = AtomicReference(State(revision = 0, serials = emptySet()))
+
+    fun get(): Set<String> = state.get().serials
+
+    /** Capture before starting a potentially slow adb status read. */
+    fun beginObservation(): Long = nextRevision.incrementAndGet()
+
+    fun replace(updated: Set<String>): Boolean = replace(beginObservation(), updated)
+
+    fun replace(observationRevision: Long, updated: Set<String>): Boolean {
+        val snapshot = updated.toSet()
+        while (true) {
+            val current = state.get()
+            // A successful connect/disconnect that completed after this read began is newer truth.
+            if (observationRevision < current.revision) {
+                return false
+            }
+            if (state.compareAndSet(current, State(observationRevision, snapshot))) {
+                return current.serials != snapshot
+            }
+        }
+    }
+
+    fun markConnected(serial: String): Boolean {
+        val revision = beginObservation()
+        while (true) {
+            val current = state.get()
+            if (revision < current.revision) {
+                return false
+            }
+            val updated = current.serials + serial
+            if (state.compareAndSet(current, State(revision, updated))) {
+                return current.serials != updated
+            }
+        }
+    }
+
+    fun markDisconnected(serial: String): Boolean {
+        val revision = beginObservation()
+        while (true) {
+            val current = state.get()
+            if (revision < current.revision) {
+                return false
+            }
+            val updated = current.serials - serial
+            if (state.compareAndSet(current, State(revision, updated))) {
+                return current.serials != updated
+            }
+        }
+    }
+}
 
 @Service(Service.Level.APP)
 class ProxyCommanderReconnectService : Disposable {
-    private val disposed = AtomicBoolean(false)
-    private val generation = AtomicInteger(0)
+    private val workState = ReconnectWorkState()
     private val lastErrorMessage = AtomicReference<String?>(null)
     private val knownConnectedSerials = AtomicReference<Set<String>>(emptySet())
     private val baselineEstablished = AtomicBoolean(false)
 
-    private val latestSnapshot = AtomicReference<Set<String>>(emptySet())
-    private val latestProxiedSerials = AtomicReference<Set<String>>(emptySet())
-    private val pendingSnapshot = AtomicReference<Set<String>?>(null)
+    private val proxiedSerialState = ProxiedSerialState()
     private val listeners = CopyOnWriteArrayList<DevicesListener>()
-    private val autoConnectInFlight = Collections.synchronizedSet(HashSet<String>())
 
     // The track-devices read loop must never block, so all adb-heavy work runs off it:
     // snapshots are processed one-at-a-time (newest wins) and auto-connect — which can wait up to
@@ -44,24 +187,26 @@ class ProxyCommanderReconnectService : Disposable {
     }
 
     fun addListener(listener: DevicesListener) {
+        if (workState.isDisposed()) {
+            return
+        }
         listeners.add(listener)
-        listener.onConnectedDevicesChanged(latestSnapshot.get())
+        if (!workState.deliverLatestSnapshot(listener::onConnectedDevicesChanged)) {
+            listeners.remove(listener)
+        }
     }
 
     fun removeListener(listener: DevicesListener) {
         listeners.remove(listener)
     }
 
-    fun connectedSerials(): Set<String> = latestSnapshot.get()
+    fun connectedSerials(): Set<String> = workState.latestSnapshotSerials()
 
-    /** Serials whose proxy + reverse mapping were confirmed by the most recent snapshot pass. */
-    fun proxiedSerials(): Set<String> = latestProxiedSerials.get()
+    /** Serials whose proxy + reverse mapping were confirmed by a snapshot or successful operation. */
+    fun proxiedSerials(): Set<String> = proxiedSerialState.get()
 
     fun refreshTracking() {
-        val token = generation.incrementAndGet()
-        if (disposed.get()) {
-            return
-        }
+        val token = workState.beginGeneration() ?: return
 
         // A single application-wide watcher auto-reconnects remembered devices and offers to connect
         // newly-appeared devices. Calling this again simply supersedes the previous loop via the
@@ -78,13 +223,18 @@ class ProxyCommanderReconnectService : Disposable {
             val controller = ProxyCommanderController(currentBasePath(), config)
             val logs = mutableListOf<String>()
             if (!controller.ensureAdbAvailable(logs::add)) {
-                notifyAutoReconnectError(summarize(logs, "ADB command is not available."))
+                if (isCurrent(token, config)) {
+                    notifyAutoReconnectError(summarize(logs, "ADB command is not available."))
+                }
                 if (!sleepWhileCurrent(token, ADB_UNAVAILABLE_RETRY_DELAY_MS)) {
                     return
                 }
                 continue
             }
 
+            if (!isCurrent(token, config)) {
+                return
+            }
             clearAutoReconnectError()
             val finished = controller.watchConnectedDevices(
                 log = logs::add,
@@ -97,6 +247,9 @@ class ProxyCommanderReconnectService : Disposable {
                 }
             )
 
+            if (!isCurrent(token)) {
+                return
+            }
             if (!finished) {
                 notifyAutoReconnectError(summarize(logs, "Stopped watching connected devices."))
             }
@@ -108,21 +261,19 @@ class ProxyCommanderReconnectService : Disposable {
     }
 
     private fun onSnapshotFast(token: Int, snapshot: Set<String>) {
-        if (!isCurrent(token)) {
+        if (!workState.publishSnapshot(token, snapshot) { fireDevicesChanged() }) {
             return
         }
-        latestSnapshot.set(snapshot)
-        fireDevicesChanged(snapshot)
-
-        pendingSnapshot.set(snapshot)
         if (snapshotExecutor.isShutdown) {
             return
         }
         runCatching {
             snapshotExecutor.execute {
-                val pending = pendingSnapshot.getAndSet(null) ?: return@execute
-                if (isCurrent(token)) {
-                    processSnapshot(token, pending)
+                // Do not capture `token` here: this runnable may have been queued by an older
+                // generation but drain a newer generation's coalesced snapshot.
+                val pending = workState.takeLatestSnapshot() ?: return@execute
+                if (isCurrent(pending.generation)) {
+                    processSnapshot(pending.generation, pending.serials)
                 }
             }
         }
@@ -140,29 +291,39 @@ class ProxyCommanderReconnectService : Disposable {
         val newSerials = if (isBaseline) emptySet() else snapshotSerials - previouslyKnown
 
         if (snapshotSerials.isEmpty()) {
-            updateProxiedSerials(emptySet())
+            updateProxiedSerials(proxiedSerialState.beginObservation(), emptySet())
             return
         }
 
         val settings = ProxyCommanderSettingsService.getInstance()
         val remembered = settings.getRememberedDeviceIds()
         val ignored = settings.getIgnoredDeviceIds()
+        val config = settings.getConfig()
 
         val logs = mutableListOf<String>()
-        val controller = ProxyCommanderController(currentBasePath(), settings.getConfig())
+        val controller = ProxyCommanderController(currentBasePath(), config)
         if (!controller.ensureAdbAvailable(logs::add)) {
-            notifyAutoReconnectError(summarize(logs, "ADB command is not available."))
+            if (isCurrent(token, config)) {
+                notifyAutoReconnectError(summarize(logs, "ADB command is not available."))
+            }
             return
         }
 
         // Details are read on every snapshot (not only when remembered/new devices exist) so the
         // status bar's proxied count stays accurate.
+        val proxyObservation = proxiedSerialState.beginObservation()
         val details = controller.listConnectedDeviceDetails(logs::add)
-        updateProxiedSerials(details.filter { it.isProxyConnected }.map { it.serial }.toSet())
+        if (!isCurrent(token, config)) {
+            return
+        }
+        updateProxiedSerials(
+            proxyObservation,
+            details.filter { it.isProxyConnected }.map { it.serial }.toSet()
+        )
 
         details.filter { it.identifier in remembered && !it.isProxyConnected }
             .forEach { device ->
-                scheduleAutoConnect(device.serial, token)
+                scheduleAutoConnect(device.serial, token, config)
             }
 
         if (newSerials.isNotEmpty()) {
@@ -172,41 +333,56 @@ class ProxyCommanderReconnectService : Disposable {
                     it.identifier !in ignored &&
                     !it.isProxyConnected
             }.forEach { device ->
-                offerConnectToDevice(device)
+                offerConnectToDevice(device, token)
             }
         }
     }
 
-    private fun updateProxiedSerials(serials: Set<String>) {
-        val previous = latestProxiedSerials.getAndSet(serials)
-        if (previous != serials) {
-            fireDevicesChanged(latestSnapshot.get())
+    private fun updateProxiedSerials(observationRevision: Long, serials: Set<String>) {
+        if (proxiedSerialState.replace(observationRevision, serials)) {
+            fireDevicesChanged()
         }
     }
 
-    private fun scheduleAutoConnect(serial: String, token: Int) {
-        if (connectExecutor.isShutdown || !autoConnectInFlight.add(serial)) {
+    private fun markProxyConnected(serial: String) {
+        if (proxiedSerialState.markConnected(serial)) {
+            fireDevicesChanged()
+        }
+    }
+
+    private fun markProxyDisconnected(serial: String) {
+        if (proxiedSerialState.markDisconnected(serial)) {
+            fireDevicesChanged()
+        }
+    }
+
+    private fun scheduleAutoConnect(serial: String, token: Int, config: ProxyCommanderConfig) {
+        val work = ReconnectAutoConnectWork(token, serial, config)
+        if (connectExecutor.isShutdown || !workState.tryStartAutoConnect(work)) {
             return
         }
         runCatching {
             connectExecutor.execute {
                 try {
-                    if (isCurrent(token)) {
-                        autoConnectRememberedDevice(serial, token)
+                    if (isCurrent(work)) {
+                        autoConnectRememberedDevice(work)
                     }
                 } finally {
-                    autoConnectInFlight.remove(serial)
+                    workState.finishAutoConnect(work)
                 }
             }
-        }.onFailure { autoConnectInFlight.remove(serial) }
+        }.onFailure { workState.finishAutoConnect(work) }
     }
 
-    private fun offerConnectToDevice(device: ConnectedDeviceDetails) {
+    private fun offerConnectToDevice(device: ConnectedDeviceDetails, token: Int) {
         val identifier = device.identifier
         val serial = device.serial
         val name = device.name.ifBlank { identifier }
 
         ApplicationManager.getApplication().invokeLater {
+            if (!isCurrent(token)) {
+                return@invokeLater
+            }
             val notification = ProxyCommanderNotifications.create(
                 "New device available: $name. Connect it to the proxy?",
                 NotificationType.INFORMATION
@@ -217,23 +393,36 @@ class ProxyCommanderReconnectService : Disposable {
             })
             notification.addAction(NotificationAction.createSimple("Don't Offer Again") {
                 notification.expire()
-                ProxyCommanderSettingsService.getInstance().ignoreDevice(identifier)
+                ProxyCommanderMutationCoordinator.execute {
+                    ProxyCommanderSettingsService.getInstance().ignoreDevice(identifier)
+                }
             })
             Notifications.Bus.notify(notification)
         }
     }
 
     private fun connectAndRememberDevice(serial: String, identifier: String, name: String) {
+        if (workState.isDisposed()) {
+            return
+        }
         ProxyCommanderExecution.runControllerOperation(
             projectBasePath = currentBasePath(),
             config = ProxyCommanderSettingsService.getInstance().getConfig(),
-            operation = { controller, log -> controller.connectDevice(serial, log) }
+            operation = { controller, log ->
+                val connected = controller.connectDevice(serial, log)
+                if (connected) {
+                    ProxyCommanderSettingsService.getInstance()
+                        .rememberDevices(listOf(RememberedDevice(identifier, name)))
+                }
+                connected
+            }
         ) { success, logs ->
+            if (workState.isDisposed()) {
+                return@runControllerOperation
+            }
             if (success) {
-                ProxyCommanderSettingsService.getInstance()
-                    .rememberDevices(listOf(RememberedDevice(identifier, name)))
                 clearAutoReconnectError()
-                fireDevicesChanged(latestSnapshot.get())
+                markProxyConnected(serial)
                 refreshTracking()
                 notifyAutoReconnectSuccess("Connected proxy to $name and enabled auto-connect.")
             } else {
@@ -242,35 +431,79 @@ class ProxyCommanderReconnectService : Disposable {
         }
     }
 
-    private fun autoConnectRememberedDevice(serial: String, token: Int) {
+    private fun autoConnectRememberedDevice(work: ReconnectAutoConnectWork) {
         repeat(AUTO_CONNECT_ATTEMPTS) { attempt ->
-            if (!isCurrent(token)) {
+            if (!isCurrent(work)) {
                 return
             }
 
             val logs = mutableListOf<String>()
-            val settings = ProxyCommanderSettingsService.getInstance()
-            val controller = ProxyCommanderController(currentBasePath(), settings.getConfig())
+            val controller = ProxyCommanderController(currentBasePath(), work.config)
             if (!controller.ensureAdbAvailable(logs::add)) {
-                notifyAutoReconnectError(summarize(logs, "ADB command is not available."))
+                if (isCurrent(work)) {
+                    notifyAutoReconnectError(summarize(logs, "ADB command is not available."))
+                }
                 return
             }
 
-            if (!controller.waitForDeviceReady(serial, DEVICE_READY_TIMEOUT_MS, logs::add)) {
-                notifyAutoReconnectError("Auto-connect failed for $serial: ${summarize(logs, "Device was not ready in time.")}")
+            if (!isCurrent(work)) {
+                return
+            }
+            if (!controller.waitForDeviceReady(work.serial, DEVICE_READY_TIMEOUT_MS, logs::add)) {
+                if (isCurrent(work)) {
+                    notifyAutoReconnectError("Auto-connect failed for ${work.serial}: ${summarize(logs, "Device was not ready in time.")}")
+                }
                 return
             }
 
-            val resolvedDevice = controller.listConnectedDeviceDetails(logs::add).firstOrNull { it.serial == serial }
-            val identifier = resolvedDevice?.identifier ?: serial
-            if (identifier !in settings.getRememberedDeviceIds()) {
+            // Device readiness may wait for up to a minute. Re-check both generation and the exact
+            // config immediately afterwards so an obsolete port is never applied after a refresh.
+            if (!isCurrent(work)) {
                 return
             }
+            val resolvedDevice = controller.listConnectedDeviceDetails(logs::add)
+                .firstOrNull { it.serial == work.serial }
+            if (!isCurrent(work)) {
+                return
+            }
+            val identifier = resolvedDevice?.identifier ?: work.serial
 
-            if (controller.connectDevice(serial, logs::add)) {
+            // Re-check desired state inside the same mutation lock used by manual actions. If
+            // settings change while adb commands run, roll back before a newer action can apply its
+            // own proxy; this prevents stale cleanup from erasing a newer valid connection.
+            val connected = ProxyCommanderMutationCoordinator.run {
+                if (!isDesired(work, identifier)) {
+                    false
+                } else if (!controller.connectDevice(work.serial, logs::add)) {
+                    false
+                } else if (!isDesired(work, identifier)) {
+                    val rolledBack = controller.disconnectDevice(
+                        work.serial,
+                        verifyInternet = false,
+                        log = logs::add
+                    )
+                    if (rolledBack) {
+                        markProxyDisconnected(work.serial)
+                    } else {
+                        // Do not claim the device is disconnected when cleanup could not be verified.
+                        refreshTracking()
+                    }
+                    false
+                } else {
+                    true
+                }
+            }
+            if (connected) {
                 clearAutoReconnectError()
-                fireDevicesChanged(latestSnapshot.get())
-                val testPassed = controller.testProxyConnection(serial, logs::add)
+                // Reflect the successful mutation before the optional host-side connection test,
+                // which can perform more adb/process work and should not keep the widget stale.
+                markProxyConnected(work.serial)
+                val testPassed = controller.testProxyConnection(work.serial, logs::add)
+                if (!isDesired(work, identifier)) {
+                    // A newer generation/manual action owns the desired state now. It is serialized
+                    // by the coordinator and must not be undone by this older worker.
+                    return
+                }
                 if (testPassed) {
                     notifyAutoReconnectSuccess("Auto-connected proxy to $identifier and verified host proxy connection.")
                 } else {
@@ -280,16 +513,20 @@ class ProxyCommanderReconnectService : Disposable {
             }
 
             if (attempt == AUTO_CONNECT_ATTEMPTS - 1) {
-                notifyAutoReconnectError("Auto-connect failed for $identifier: ${summarize(logs, "Unknown error.")}")
-            } else if (!sleepWhileCurrent(token, AUTO_CONNECT_RETRY_DELAY_MS)) {
+                if (isDesired(work, identifier)) {
+                    notifyAutoReconnectError("Auto-connect failed for $identifier: ${summarize(logs, "Unknown error.")}")
+                }
+            } else if (!sleepWhileDesired(work, identifier, AUTO_CONNECT_RETRY_DELAY_MS)) {
                 return
             }
         }
     }
 
-    private fun fireDevicesChanged(connectedSerials: Set<String>) {
-        listeners.forEach { listener ->
-            runCatching { listener.onConnectedDevicesChanged(connectedSerials) }
+    private fun fireDevicesChanged() {
+        workState.deliverLatestSnapshot { connectedSerials ->
+            listeners.forEach { listener ->
+                runCatching { listener.onConnectedDevicesChanged(connectedSerials) }
+            }
         }
     }
 
@@ -300,11 +537,14 @@ class ProxyCommanderReconnectService : Disposable {
         ProxyCommanderExecution.summarize(logs, fallback)
 
     private fun notifyAutoReconnectError(message: String) {
-        if (message.isBlank()) {
+        if (workState.isDisposed() || message.isBlank()) {
             return
         }
         val previous = lastErrorMessage.getAndSet(message)
         if (previous == message) {
+            return
+        }
+        if (workState.isDisposed()) {
             return
         }
         ProxyCommanderNotifications.notify(message, NotificationType.ERROR)
@@ -315,6 +555,9 @@ class ProxyCommanderReconnectService : Disposable {
     }
 
     private fun notifyAutoReconnectSuccess(message: String) {
+        if (workState.isDisposed()) {
+            return
+        }
         ProxyCommanderNotifications.notify(message, NotificationType.INFORMATION)
     }
 
@@ -331,12 +574,35 @@ class ProxyCommanderReconnectService : Disposable {
         return isCurrent(token)
     }
 
+    private fun sleepWhileDesired(work: ReconnectAutoConnectWork, identifier: String, delayMs: Long): Boolean {
+        val deadline = System.currentTimeMillis() + delayMs
+        while (isDesired(work, identifier) && System.currentTimeMillis() < deadline) {
+            try {
+                Thread.sleep(250)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+                return false
+            }
+        }
+        return isDesired(work, identifier)
+    }
+
     private fun isCurrent(token: Int): Boolean =
-        !disposed.get() && generation.get() == token
+        workState.isCurrent(token)
+
+    private fun isCurrent(token: Int, config: ProxyCommanderConfig): Boolean =
+        isCurrent(token) && ProxyCommanderSettingsService.getInstance().getConfig() == config
+
+    private fun isCurrent(work: ReconnectAutoConnectWork): Boolean =
+        isCurrent(work.generation, work.config)
+
+    private fun isDesired(work: ReconnectAutoConnectWork, identifier: String): Boolean =
+        isCurrent(work) && identifier in ProxyCommanderSettingsService.getInstance().getRememberedDeviceIds()
 
     override fun dispose() {
-        disposed.set(true)
-        generation.incrementAndGet()
+        if (!workState.dispose()) {
+            return
+        }
         snapshotExecutor.shutdownNow()
         connectExecutor.shutdownNow()
         listeners.clear()

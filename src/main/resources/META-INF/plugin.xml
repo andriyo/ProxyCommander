@@ -61,17 +61,17 @@
             <action id="ProxyCommander.ConnectAllDevicesAction"
                     class="io.github.andriyo.proxycommander.ConnectAllDevicesAction"
                     text="Connect Proxy to All Devices"
-                    description="Enable reverse proxy and HTTP proxy on all available devices"
+                    description="Enable the proxy and remember all available devices for auto-connect"
                     icon="/icons/proxy_connect_all.svg"/>
             <action id="ProxyCommander.ConnectActiveEmulatorClearOthersProxyAction"
                     class="io.github.andriyo.proxycommander.ConnectActiveEmulatorClearOthersProxyAction"
                     text="Connect Proxy to Current and Disconnect Others"
-                    description="Enable reverse proxy for the current device and disconnect proxy from all other available devices"
+                    description="Proxy only the current device and make it the sole auto-connect target"
                     icon="/icons/proxy_connect_active.svg"/>
             <action id="ProxyCommander.DisconnectAllDevicesAction"
                     class="io.github.andriyo.proxycommander.DisconnectAllDevicesAction"
                     text="Disconnect Proxy from All Devices"
-                    description="Disable reverse proxy and clear HTTP proxy on all available devices"
+                    description="Disable reverse proxy, clear HTTP proxy, and turn off auto-connect for all devices"
                     icon="/icons/proxy_disconnect_all.svg"/>
             <action id="ProxyCommander.KeepSelectedDeviceAction"
                     class="io.github.andriyo.proxycommander.KeepSelectedDeviceAction"
@@ -88,21 +88,21 @@
         <action id="ProxyCommander.StreamingConnectAllAction"
                 class="io.github.andriyo.proxycommander.ConnectAllDevicesAction"
                 text="Connect Proxy to All"
-                description="Enable reverse proxy and HTTP proxy on all available devices"
+                description="Enable the proxy and remember all available devices for auto-connect"
                 icon="/icons/proxy_connect_all.svg">
             <add-to-group group-id="StreamingToolbarSecondary" anchor="last"/>
         </action>
         <action id="ProxyCommander.StreamingConnectCurrentAction"
                 class="io.github.andriyo.proxycommander.ConnectActiveEmulatorClearOthersProxyAction"
                 text="Connect Proxy to Current"
-                description="Enable reverse proxy for the current device and disconnect proxy from all other available devices"
+                description="Proxy only the current device and make it the sole auto-connect target"
                 icon="/icons/proxy_connect_active.svg">
             <add-to-group group-id="StreamingToolbarSecondary" anchor="after" relative-to-action="ProxyCommander.StreamingConnectAllAction"/>
         </action>
         <action id="ProxyCommander.StreamingDisconnectAllAction"
                 class="io.github.andriyo.proxycommander.DisconnectAllDevicesAction"
                 text="Disconnect Proxy from All"
-                description="Disable reverse proxy and clear HTTP proxy on all available devices"
+                description="Disable reverse proxy, clear HTTP proxy, and turn off auto-connect for all devices"
                 icon="/icons/proxy_disconnect_all.svg">
             <add-to-group group-id="StreamingToolbarSecondary" anchor="after" relative-to-action="ProxyCommander.StreamingConnectCurrentAction"/>
         </action>

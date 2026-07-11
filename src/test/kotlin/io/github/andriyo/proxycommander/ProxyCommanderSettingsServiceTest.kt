@@ -2,6 +2,8 @@ package io.github.andriyo.proxycommander
 
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertNotNull
+import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 
@@ -160,6 +162,18 @@ class ProxyCommanderSettingsServiceTest {
         service.importLegacyState(ProxyCommanderSettingsService.State(resetTimeOnConnect = false))
 
         assertFalse(service.getConfig().resetTimeOnConnect)
+    }
+
+    @Test
+    fun legacyProjectSettings_consumesDisabledResetTimeAsSoleCustomization() {
+        val legacySettings = ProxyCommanderLegacyProjectSettings()
+        legacySettings.loadState(ProxyCommanderSettingsService.State(resetTimeOnConnect = false))
+
+        val legacyState = legacySettings.consume()
+
+        assertNotNull(legacyState)
+        assertFalse(legacyState!!.resetTimeOnConnect)
+        assertNull(legacySettings.consume())
     }
 
     @Test

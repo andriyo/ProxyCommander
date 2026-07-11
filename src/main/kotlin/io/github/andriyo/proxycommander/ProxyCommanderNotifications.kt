@@ -26,6 +26,10 @@ internal object ProxyCommanderNotifications {
         }
         val notification = create(message, type)
         ApplicationManager.getApplication().invokeLater {
+            if (project?.isDisposed == true) {
+                notification.expire()
+                return@invokeLater
+            }
             if (project != null) {
                 Notifications.Bus.notify(notification, project)
             } else {

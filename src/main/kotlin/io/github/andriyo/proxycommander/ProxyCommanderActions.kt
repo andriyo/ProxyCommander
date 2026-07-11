@@ -8,7 +8,7 @@ import com.intellij.openapi.project.DumbAwareAction
 
 class ConnectAllDevicesAction : DumbAwareAction(
     "Connect Proxy to All Devices",
-    "Enable reverse proxy and HTTP proxy on all available devices",
+    "Enable the proxy and remember all available devices for auto-connect",
     null
 ) {
     override fun actionPerformed(event: AnActionEvent) {
@@ -19,7 +19,7 @@ class ConnectAllDevicesAction : DumbAwareAction(
 
 class DisconnectAllDevicesAction : DumbAwareAction(
     "Disconnect Proxy from All Devices",
-    "Disable reverse proxy and clear HTTP proxy on all available devices",
+    "Disable reverse proxy, clear HTTP proxy, and turn off auto-connect for all devices",
     null
 ) {
     override fun actionPerformed(event: AnActionEvent) {
@@ -41,7 +41,7 @@ class KeepSelectedDeviceAction : DumbAwareAction(
 
 class ConnectActiveEmulatorClearOthersProxyAction : DumbAwareAction(
     "Connect Proxy to Current and Disconnect Others",
-    "Enable reverse proxy for the current device and disconnect proxy from all other available devices",
+    "Proxy only the current device and make it the sole auto-connect target",
     AllIcons.Actions.Execute
 ) {
     override fun getActionUpdateThread(): ActionUpdateThread = ActionUpdateThread.BGT

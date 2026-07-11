@@ -5,7 +5,7 @@ plugins {
 }
 
 group = "io.github.andriyo"
-version = "1.4.0"
+version = "1.4.1"
 
 val androidStudioVersion = providers.gradleProperty("androidStudioVersion").orElse("2024.2.1.11")
 val androidStudioPath = providers.gradleProperty("androidStudioPath")
@@ -41,6 +41,15 @@ intellijPlatform {
         }
 
         changeNotes = """
+            <h3>1.4.1</h3>
+            <ul>
+              <li>Fixed: proxy and reverse changes are now transactional, verified, and rolled back safely when adb operations fail.</li>
+              <li>Fixed: manual actions and auto-reconnect mutations now run in FIFO order; stale reconnect work can no longer overwrite newer device intent or status.</li>
+              <li>Better: disconnect verifies direct device internet access using a real HTTP response and reports a non-fatal warning when connectivity cannot be confirmed.</li>
+              <li>Fixed: <b>Connect Proxy to Current</b> no longer guesses a target when several devices are attached without active IDE context.</li>
+              <li>Fixed: migration preserves a disabled clock-reset setting, and disposed projects/dialogs no longer receive late background UI updates.</li>
+              <li>Better: release builds now validate the tag, plugin structure, compatibility, signature, license, and signed artifact before publication.</li>
+            </ul>
             <h3>1.4.0</h3>
             <ul>
               <li>New: per-device <b>Unproxy</b> and <b>Forget</b> (disable auto-connect) buttons in the Devices dialog.</li>
@@ -119,6 +128,12 @@ tasks {
     withType<JavaCompile> {
         sourceCompatibility = "21"
         targetCompatibility = "21"
+    }
+    jar {
+        // Apache-2.0 redistribution requires the license to accompany the plugin artifact.
+        from(rootProject.file("LICENSE")) {
+            into("META-INF")
+        }
     }
     test {
         useJUnitPlatform()

@@ -22,11 +22,36 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
 
+      - name: Verify release tag matches plugin version
+        shell: bash
+        run: |
+          set -euo pipefail
+          project_version="$(./gradlew properties -q --console=plain | awk '$1 == "version:" { print $2; exit }')"
+          if [[ -z "$project_version" ]]; then
+            echo "Could not determine the Gradle project version." >&2
+            exit 1
+          fi
+          expected_tag="v${project_version}"
+          if [[ "$GITHUB_REF_NAME" != "$expected_tag" ]]; then
+            echo "Release tag '$GITHUB_REF_NAME' does not match Gradle project version '$project_version' (expected '$expected_tag')." >&2
+            exit 1
+          fi
+
       - name: Run unit tests
         run: ./gradlew test
 
       - name: Build plugin
         run: ./gradlew buildPlugin
+
+      - name: Verify plugin compatibility and project configuration
+        run: ./gradlew verifyPlugin verifyPluginProjectConfiguration verifyPluginStructure --no-parallel
+
+      - name: Sign plugin
+        run: ./gradlew signPlugin verifyPluginSignature
+        env:
+          CERTIFICATE_CHAIN: ${{ secrets.CERTIFICATE_CHAIN }}
+          PRIVATE_KEY: ${{ secrets.PRIVATE_KEY }}
+          PRIVATE_KEY_PASSWORD: ${{ secrets.PRIVATE_KEY_PASSWORD }}
 
       - name: Publish to JetBrains Marketplace
         run: ./gradlew publishPlugin
@@ -39,5 +64,5 @@ jobs:
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          files: build/distributions/*.zip
+          files: build/distributions/*-signed.zip
           generate_release_notes: true

@@ -211,7 +211,16 @@ internal class AdbClient(
                     onSnapshot(ProxyCommanderParsing.parseTrackedDevicesSnapshot(payload.toString(Charsets.UTF_8)))
                 }
             }
-            true
+            val stoppedByRequest = shouldStop()
+            if (!stoppedByRequest) {
+                val exitSuffix = if (!process.isAlive) {
+                    runCatching { " (exit code ${process.exitValue()})" }.getOrDefault("")
+                } else {
+                    ""
+                }
+                log("[ProxyCommander] adb track-devices stopped unexpectedly$exitSuffix.")
+            }
+            stoppedByRequest
         } catch (error: InterruptedException) {
             Thread.currentThread().interrupt()
             true

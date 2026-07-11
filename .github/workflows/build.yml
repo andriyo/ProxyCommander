@@ -64,8 +64,8 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
 
-      - name: Run IntelliJ Plugin Verifier
-        run: ./gradlew verifyPlugin
+      - name: Run IntelliJ Plugin and project configuration verifiers
+        run: ./gradlew verifyPlugin verifyPluginProjectConfiguration verifyPluginStructure --no-parallel
 
       - name: Upload verifier report
         if: always()

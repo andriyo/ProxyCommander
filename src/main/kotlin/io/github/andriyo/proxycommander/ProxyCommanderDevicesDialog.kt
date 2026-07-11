@@ -30,7 +30,9 @@ import javax.swing.JPanel
 internal object ProxyCommanderUi {
     fun openDevicesDialog(project: Project) {
         ApplicationManager.getApplication().invokeLater {
-            DevicesDialog(project, ProxyCommanderSettingsService.getInstance()).show()
+            if (!project.isDisposed) {
+                DevicesDialog(project, ProxyCommanderSettingsService.getInstance()).show()
+            }
         }
     }
 }
@@ -94,8 +96,10 @@ private class DevicesDialog(
         refreshButton.addActionListener { reloadDevices() }
         connectAllButton.addActionListener { connectAllDevices() }
         disconnectAllButton.addActionListener { disconnectAllDevices() }
+        connectAllButton.toolTipText = "Proxy all connected devices and remember them for auto-connect"
+        disconnectAllButton.toolTipText = "Unproxy connected devices and disable auto-connect for every device"
+        // addListener() immediately publishes the latest snapshot, which performs the initial load.
         ProxyCommanderReconnectService.getInstance().addListener(devicesListener)
-        reloadDevices()
     }
 
     override fun dispose() {
@@ -242,8 +246,8 @@ private class DevicesDialog(
                 settings.rememberDevices(
                     controller.listConnectedDeviceDetails(log).map { RememberedDevice(it.identifier, it.name) }
                 )
-                ProxyCommanderReconnectService.getInstance().refreshTracking()
             }
+            ProxyCommanderReconnectService.getInstance().refreshTracking()
             success
         }
     }
@@ -252,13 +256,14 @@ private class DevicesDialog(
         runOperation(
             busyMessage = "Removing proxy from all devices...",
             fallbackSuccess = "Proxy disconnected from all available devices.",
-            fallbackFailure = "Failed to disconnect proxy from all available devices."
-        ) { controller, log ->
-            val success = controller.disconnectAllDevices(log)
-            if (success) {
+            fallbackFailure = "Failed to disconnect proxy from all available devices.",
+            beforeOperation = {
                 settings.clearRememberedDevices()
                 ProxyCommanderReconnectService.getInstance().refreshTracking()
             }
+        ) { controller, log ->
+            val success = controller.disconnectAllDevices(log)
+            ProxyCommanderReconnectService.getInstance().refreshTracking()
             success
         }
     }
@@ -273,8 +278,8 @@ private class DevicesDialog(
             val success = controller.connectDevice(serial, log)
             if (success) {
                 settings.rememberDevices(listOf(RememberedDevice(entry.id, entry.name)))
-                ProxyCommanderReconnectService.getInstance().refreshTracking()
             }
+            ProxyCommanderReconnectService.getInstance().refreshTracking()
             success
         }
     }
@@ -286,12 +291,12 @@ private class DevicesDialog(
             fallbackFailure = "Failed to connect proxy only to ${entry.id}."
         ) { controller, log ->
             val serial = entry.serial ?: return@runOperation false
-            val success = controller.keepOnlyDevice(serial, log)
-            if (success) {
+            val outcome = controller.keepOnlyDeviceWithOutcome(serial, log)
+            if (outcome.selectedConnected) {
                 settings.replaceRememberedDevices(listOf(RememberedDevice(entry.id, entry.name)))
-                ProxyCommanderReconnectService.getInstance().refreshTracking()
             }
-            success
+            ProxyCommanderReconnectService.getInstance().refreshTracking()
+            outcome.success
         }
     }
 
@@ -299,23 +304,37 @@ private class DevicesDialog(
         runOperation(
             busyMessage = "Removing proxy from ${entry.id}...",
             fallbackSuccess = "Proxy removed from ${entry.id}.",
-            fallbackFailure = "Failed to remove proxy from ${entry.id}."
-        ) { controller, log ->
-            val serial = entry.serial ?: return@runOperation false
-            val success = controller.disconnectDevice(serial, log)
-            if (success) {
-                // Also stop auto-connect; otherwise the watcher would re-apply the proxy moments later.
+            fallbackFailure = "Failed to remove proxy from ${entry.id}.",
+            beforeOperation = {
                 settings.forgetDevice(entry.id)
                 ProxyCommanderReconnectService.getInstance().refreshTracking()
             }
+        ) { controller, log ->
+            val serial = entry.serial ?: return@runOperation false
+            val success = controller.disconnectDevice(serial, log)
+            ProxyCommanderReconnectService.getInstance().refreshTracking()
             success
         }
     }
 
     private fun forgetDevice(entry: DeviceDialogEntry) {
-        settings.forgetDevice(entry.id)
-        ProxyCommanderReconnectService.getInstance().refreshTracking()
-        reloadDevices("Auto-connect disabled for ${entry.name}.")
+        busy = true
+        setControlsEnabled(false)
+        showStatus("Disabling auto-connect for ${entry.name}...", loading = true)
+        ProxyCommanderMutationCoordinator.execute {
+            settings.forgetDevice(entry.id)
+            ProxyCommanderReconnectService.getInstance().refreshTracking()
+            ApplicationManager.getApplication().invokeLater(
+                {
+                    if (isDisposed || project.isDisposed) {
+                        return@invokeLater
+                    }
+                    busy = false
+                    reloadDevices("Auto-connect disabled for ${entry.name}.")
+                },
+                ModalityState.any()
+            )
+        }
     }
 
     private fun testConnection(entry: DeviceDialogEntry) {
@@ -338,6 +357,7 @@ private class DevicesDialog(
         reloadAfter: Boolean = true,
         showDialogOnCompletion: Boolean = false,
         showNotificationOnCompletion: Boolean = true,
+        beforeOperation: () -> Unit = {},
         operation: (ProxyCommanderController, (String) -> Unit) -> Boolean
     ) {
         busy = true
@@ -346,11 +366,15 @@ private class DevicesDialog(
         ProxyCommanderExecution.runControllerOperation(
             projectBasePath = project.basePath,
             config = settings.getConfig(),
+            beforeOperation = beforeOperation,
             operation = operation
         ) { success, logs ->
             val message = ProxyCommanderExecution.summarize(logs, if (success) fallbackSuccess else fallbackFailure)
             ApplicationManager.getApplication().invokeLater(
                 {
+                    if (isDisposed || project.isDisposed) {
+                        return@invokeLater
+                    }
                     busy = false
                     if (showNotificationOnCompletion) {
                         ProxyCommanderNotifications.notify(

@@ -19,8 +19,9 @@ internal object ProxyCommanderActionRunner {
                 settings.rememberDevices(
                     controller.listConnectedDeviceDetails(log).map { RememberedDevice(it.identifier, it.name) }
                 )
-                ProxyCommanderReconnectService.getInstance().refreshTracking()
             }
+            // Proxy/reverse state may have changed even when one device failed.
+            ProxyCommanderReconnectService.getInstance().refreshTracking()
             success
         }
     }
@@ -30,13 +31,16 @@ internal object ProxyCommanderActionRunner {
         runWithNotification(
             project = project,
             actionName = "Disconnect proxy from all devices",
-            includeEmulatorSummary = true
-        ) { controller, log ->
-            val success = controller.disconnectAllDevices(log)
-            if (success) {
+            includeEmulatorSummary = true,
+            beforeOperation = {
+                // Desired state is ordered with adb mutations so a later Disconnect wins over any
+                // already-running Connect action, even when adb cleanup itself fails.
                 settings.clearRememberedDevices()
                 ProxyCommanderReconnectService.getInstance().refreshTracking()
             }
+        ) { controller, log ->
+            val success = controller.disconnectAllDevices(log)
+            ProxyCommanderReconnectService.getInstance().refreshTracking()
             success
         }
     }
@@ -53,16 +57,16 @@ internal object ProxyCommanderActionRunner {
         ) { controller, log ->
             val activeSerial = resolveActiveDeviceSerial(target, controller, log)
                 ?: return@runWithNotification false
-            val success = controller.connectDeviceAndClearProxyOnOthers(activeSerial, log)
-            if (success) {
+            val outcome = controller.connectDeviceAndClearProxyOnOthersWithOutcome(activeSerial, log)
+            if (outcome.selectedConnected) {
                 val remembered = controller.listConnectedDeviceDetails(log)
                     .firstOrNull { it.serial == activeSerial }
                     ?.let { RememberedDevice(it.identifier, it.name) }
                     ?: RememberedDevice(activeSerial, activeSerial)
                 settings.replaceRememberedDevices(listOf(remembered))
-                ProxyCommanderReconnectService.getInstance().refreshTracking()
             }
-            success
+            ProxyCommanderReconnectService.getInstance().refreshTracking()
+            outcome.success
         }
     }
 
@@ -76,6 +80,7 @@ internal object ProxyCommanderActionRunner {
         project: Project,
         actionName: String,
         includeEmulatorSummary: Boolean = false,
+        beforeOperation: () -> Unit = {},
         operation: (ProxyCommanderController, (String) -> Unit) -> Boolean
     ) {
         val config = ProxyCommanderSettingsService.getInstance().getConfig()
@@ -84,6 +89,7 @@ internal object ProxyCommanderActionRunner {
         ProxyCommanderExecution.runControllerOperation(
             projectBasePath = project.basePath,
             config = config,
+            beforeOperation = beforeOperation,
             operation = { controller, log ->
                 operationRan = true
                 if (includeEmulatorSummary) {
@@ -139,14 +145,6 @@ internal object ProxyCommanderActionRunner {
             val device = devices.single()
             log("[ProxyCommander] Active device context unavailable; using the only connected device ${device.serial}.")
             return device.serial
-        }
-
-        // With several devices attached, a lone emulator is still an unambiguous "current" target.
-        val emulators = devices.filter { it.isEmulator }
-        if (emulators.size == 1) {
-            val emulator = emulators.single()
-            log("[ProxyCommander] Active device context unavailable; using the only connected emulator ${emulator.serial}.")
-            return emulator.serial
         }
 
         if (devices.isEmpty()) {

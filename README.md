@@ -9,12 +9,14 @@ Android Studio plugin for quickly controlling `adb reverse`, device proxy setup,
   - sets `settings global http_proxy localhost:<port>`
 - Connect Proxy to Current and Disconnect Others:
   - detects the active device (emulator or physical) from IDE context; with no context it falls
-    back to the only connected device, or the only connected emulator
+    back only when exactly one device is connected
   - connects proxy on that device
   - clears proxy settings on all other available devices
 - Disconnect Proxy from All Devices:
   - removes reverse mapping
   - clears proxy settings (including PAC)
+  - verifies direct internet access by requiring a valid device-side HTTP response; an offline
+    device produces a warning without turning successful proxy cleanup into a failure
 - Devices...:
   - lists available devices alongside remembered auto-connect targets
   - shows connection and proxy status, plus API level and serial
@@ -79,15 +81,16 @@ migrated automatically the first time a project opens.
 2. Install from disk in Android Studio:
    - `Settings/Preferences -> Plugins`
    - gear icon -> `Install Plugin from Disk...`
-   - select the ZIP under `build/distributions/` (e.g. `ProxyCommander-1.4.0.zip`)
+   - select the ZIP under `build/distributions/` (e.g. `ProxyCommander-1.4.1.zip`)
 3. Restart Android Studio.
 
 ## Releasing
 
-Pushing a `v*` tag (e.g. `v1.4.0`) runs the `Release` workflow: unit tests, `buildPlugin`,
-`publishPlugin` to JetBrains Marketplace (using the `PUBLISH_TOKEN`, `CERTIFICATE_CHAIN`,
-`PRIVATE_KEY`, and `PRIVATE_KEY_PASSWORD` repository secrets), and a GitHub release with the
-plugin ZIP attached.
+Pushing a `v*` tag that exactly matches the Gradle project version (e.g. `v1.4.1`) runs the
+`Release` workflow: unit tests, plugin compatibility and project-configuration verification,
+structure checks, signing, `publishPlugin` to JetBrains Marketplace (using the `PUBLISH_TOKEN`,
+`CERTIFICATE_CHAIN`, `PRIVATE_KEY`, and `PRIVATE_KEY_PASSWORD` repository secrets), and a GitHub
+release with only the signed plugin ZIP attached.
 
 ## Run in sandbox (development)
 
@@ -104,7 +107,12 @@ These tests call `ProxyCommanderController` methods directly and verify on conne
 - `Connect active emulator and clear others' proxy` keeps only the active emulator proxied
 - `Disconnect All` clears proxy/reverse
 - with connect enabled, devices can reach `http://0.0.0.0:<port>`
-- after disconnect, devices cannot reach `http://0.0.0.0:<port>` but can still reach internet hosts
+- after disconnect, devices cannot reach `http://0.0.0.0:<port>` but receive a valid HTTP status
+  response directly from at least one internet host
+
+> **Warning:** This suite mutates and clears proxy/reverse state on every attached adb device. It
+> runs `adb root`/`adb unroot` and deliberately drifts, then resets, emulator clocks. Run it only
+> with isolated, disposable emulators; disconnect physical and shared devices first.
 
 Run:
 
